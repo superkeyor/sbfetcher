@@ -1,0 +1,19 @@
+# This file keeps the chromiumprofile/ directory tracked by git while the
+# directory itself stays empty by default.
+#
+# To ship a pre-configured Chrome profile with the Docker image:
+#   1. Copy your Chrome profile folder contents here:
+#        cp -r ~/Desktop/chromiumprofile/* ./chromiumprofile/
+#   2. Build normally:
+#        ./upload             # multi-arch push to Docker Hub
+#        docker compose build # local only
+#
+# The Dockerfile copies everything in this folder to /app/chromiumprofile/
+# inside the image, and CHROME_USER_DATA_DIR defaults to that path.
+#
+# If this folder is empty (no profile copied), Chrome creates a fresh profile
+# at /app/chromiumprofile/ on first launch — still persistent within the
+# container lifetime.
+#
+# For cross-restart persistence without baking the profile in, mount a volume:
+#   docker run -v ./chromiumprofile:/app/chromiumprofile ...

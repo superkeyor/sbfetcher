@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+csd="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+[[ "$csd" == *.app/Contents/Resources ]] && csd="$(dirname "$(dirname "$(dirname "$csd")")")"
+cd "$csd"
+
+REPO_NAME="sbfetcher"
+GITHUB_USER="superkeyor"
+DOCKERHUB_USER="superkeyor"
+REPO_VISIBILITY="--public"
+
+# ── Per-project overrides ─────────────────────────────────────────────────────
+RUN_GIT=true      # true/false: git add + commit (+ push to GitHub if not local)
+
+RUN_DOCKER=true   # true/false: docker hub build + push
+DOCKER_CHOICE="2" # ""=ask, "1"=native, "2"=buildx multi-platform (linux/amd64,linux/arm64), "3"=skip
+
+RUN_REMOTE=false  # true/false: rsync + remote docker build
+SSH_LOGIN=""      # e.g. 'ssh -p 2023 parallels@192.168.1.81'
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 1. Git: commit (+ push to GitHub if not local) ───────────────────────────
+if [[ "$RUN_GIT" == false ]]; then
+    echo "Skipping git commit and push (not enabled)."
+else
+    git add -A
+    git commit -m 'update'
+    if [[ "$REPO_VISIBILITY" == "--local" ]]; then
+        echo "Local mode: skipping git push (no remote)."
+    else
+        git push git@github.com:${GITHUB_USER}/${REPO_NAME}.git
+    fi
+fi
+
+# ── 2. Docker Hub: build + push ───────────────────────────────────────────────
+if [[ "$RUN_DOCKER" == false ]]; then
+    echo "Skipping Docker Hub push (not enabled)."
+elif [[ $(command -v docker) != "" ]]; then
+    if [[ "${REPO_VISIBILITY}" == "--private" ]]; then
+        echo "Repo is private. Skipping Docker Hub push."
+    else
+        if [[ -z "$DOCKER_CHOICE" ]]; then
+            echo "Push to Docker Hub ${DOCKERHUB_USER}/${REPO_NAME}:latest?"
+            echo "  1) Yes, native platform"
+            echo "  2) Yes, multi-platform (linux/amd64,linux/arm64) via buildx"
+            echo "  3) No, skip"
+            read -p "Choice [1]: " DOCKER_CHOICE
+        fi
+        DOCKER_CHOICE=${DOCKER_CHOICE:-1}
+
+        DATE_TAG=$(date +%Y%m%d)
+        if [[ "$DOCKER_CHOICE" == "1" ]]; then
+            echo "Building and pushing native platform image..."
+            sudo docker build --progress=plain                 --tag ${DOCKERHUB_USER}/${REPO_NAME}:latest                 --tag ${DOCKERHUB_USER}/${REPO_NAME}:${DATE_TAG}                 .
+            sudo docker image push ${DOCKERHUB_USER}/${REPO_NAME}:latest
+            sudo docker image push ${DOCKERHUB_USER}/${REPO_NAME}:${DATE_TAG}
+        elif [[ "$DOCKER_CHOICE" == "2" ]]; then
+            echo "Building and pushing multi-platform image..."
+            sudo docker buildx build --progress=plain                 --platform linux/amd64,linux/arm64                 --tag ${DOCKERHUB_USER}/${REPO_NAME}:latest                 --tag ${DOCKERHUB_USER}/${REPO_NAME}:${DATE_TAG}                 --push                 .
+        else
+            echo "Skipping Docker Hub push (user choice)."
+        fi
+    fi
+fi
+
+# ── 3. Remote SSH: rsync + build ─────────────────────────────────────────────
+if [[ "$RUN_REMOTE" == false ]]; then
+    echo "Skipping remote build (not enabled)."
+elif [[ -z "$SSH_LOGIN" ]]; then
+    echo "Skipping remote build (SSH_LOGIN not set)."
+else
+    echo "Building remotely via $SSH_LOGIN..."
+    port=$(echo "$SSH_LOGIN" | cut -d' ' -f3)
+    user=$(echo "$SSH_LOGIN" | cut -d' ' -f4 | cut -d'@' -f1)
+    host=$(echo "$SSH_LOGIN" | cut -d' ' -f4 | cut -d'@' -f2)
+    folder=/home/$user/App/$REPO_NAME
+
+    # Ensure rsync is available on remote
+    ssh -p $port $user@$host "command -v rsync >/dev/null 2>&1 || { echo 'Installing rsync...'; sudo apt-get install -y rsync; }"
+
+    # Sync files
+    ssh -p $port $user@$host "mkdir -p $folder"
+    rsync -e "ssh -p $port" . $user@$host:$folder/         -avz --delete         --exclude='.git/'         --exclude='__pycache__/'         --exclude='.DS_Store'         --exclude='._*'
+        # -avz: archive, verbose, compress
+
+    # Build on remote
+    # -t: allocate a pseudo-terminal
+    ssh -p $port $user@$host -t "
+    cd $folder && \
+    sudo docker compose -f /data/caddy/docker-compose.yml down && \
+    sudo docker build --progress=plain --tag ${REPO_NAME}:latest $folder && \
+    sudo docker compose -f /data/caddy/docker-compose.yml up -d && \
+    sudo docker system prune --force
+"
+
+    # Local git tracking of remote deploy
+    git add -A
+    git commit -m 'remote deploy'
+fi
+
+echo ""
+echo "Visit (if available) https://github.com/${GITHUB_USER}/${REPO_NAME}"
+echo "                     https://hub.docker.com/r/${DOCKERHUB_USER}/${REPO_NAME}/tags"
+echo ""

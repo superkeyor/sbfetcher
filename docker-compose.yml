@@ -1,30 +1,115 @@
-# ==============================================================================
-# SECURITY NOTE: Environment variables are defined here directly, not in a .env file,
-# to prevent accidental exposure through misconfigured servers or backups.
+# ============================================================================
+# changedetection.io + SeleniumBase fetcher
 #
-# WARNING: This file contains plain text secrets. DO NOT commit to version control.
-# Keep only on the production server with restricted permissions.
-# ==============================================================================
+# Usage:
+#   docker compose up -d
+#
+# changedetection.io UI: http://localhost:5000
+#   (override to :5555 via docker-compose.override.yml for local dev on Mac, because 5000 used by airplay)
+# Fetcher API:           http://localhost:3000
+#   POST /content        -> rendered HTML
+#   POST /screenshot     -> PNG image
+#   WS   /cdp            -> Chrome CDP proxy (for PLAYWRIGHT_DRIVER_URL)
+#   POST /v1             -> FlareSolverr-compatible endpoint (for direct API use)
+#   GET  /health
+#   GET  /metrics
+#
+# changedetection.io integration:
+#   Playwright fetch:   PLAYWRIGHT_DRIVER_URL=ws://sbfetcher:3000/cdp
+#   (FLARESOLVERR_URL is NOT supported by changedetection.io v0.55.5 - env var is ignored)
+# ============================================================================
+
 services:
-    myapp:
-        image: myapp:latest
-        container_name: myapp
-        restart: always
-        ports:
-            - "127.0.0.1:5000:5000"
-        environment:
-            - FLASK_ENV=production
-            # Format: postgresql://USER:PASSWORD@HOST:PORT/NAME  (HOST is service/container name for Docker built-in DNS)
-            - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@myapp_db:5432/myapp
-        depends_on:
-            - myapp_db
-    myapp_db:
-        image: postgres:18-alpine
-        container_name: myapp_db
-        restart: always
-        environment:
-            POSTGRES_USER: ${DB_USER}
-            POSTGRES_PASSWORD: ${DB_PASSWORD}
-            POSTGRES_DB: myapp
+    # --------------------------------------------------------------------------
+    # changedetection.io
+    # --------------------------------------------------------------------------
+    changedetection:
+        image: ghcr.io/dgtlmoon/changedetection.io:latest
+        container_name: changedetection
+        restart: unless-stopped
         volumes:
-            - /data/myapp/db:/var/lib/postgresql/data # Production system path
+            - /data/changedetection:/datastore
+        ports:
+            - "5000:5000"
+        environment:
+            - PUID=1000
+            - PGID=1000
+            # Playwright fetch: connect_over_cdp() via the /cdp WebSocket proxy
+            # Enables the "Playwright Chromium/Javascript via 'ws://sbfetcher:3000/cdp'" option
+            - PLAYWRIGHT_DRIVER_URL=ws://sbfetcher:3000/cdp
+            # - PLAYWRIGHT_DRIVER_URL=ws://changedetection_playwright:3000/?stealth=1&--disable-web-security=true
+            
+            - FETCH_WORKERS=2
+            - LOGGER_LEVEL=INFO
+
+            # An exclude list (useful for notification URLs above) can be specified with
+            - NO_PROXY=localhost,192.168.0.0/24
+            
+            # Base URL of your changedetection.io install (Added to the notification alert)
+            - BASE_URL=https://change.zhupsy.com
+            # self-note: do not add USE_X_SETTINGS - otherwise not working properly
+            # Respect proxy_pass type settings, `proxy_set_header Host "localhost";` and `proxy_set_header X-Forwarded-Prefix /app;`
+            # More here https://github.com/dgtlmoon/changedetection.io/wiki/Running-changedetection.io-behind-a-reverse-proxy
+            # - USE_X_SETTINGS=1
+            
+            # Hides the Referer header so that monitored websites cannot see the changedetection.io hostname.
+            - HIDE_REFERER=true
+            
+            # Not use the 'check version' / telemetry service
+            - DISABLE_VERSION_CHECK=true
+            
+            - TZ=America/Chicago
+            - LC_ALL=en_US.UTF-8
+        
+        depends_on:
+            sbfetcher:
+                condition: service_healthy
+        healthcheck:
+            test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/').read()"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+
+    # --------------------------------------------------------------------------
+    # SeleniumBase + FastAPI headless Chrome fetcher
+    # --------------------------------------------------------------------------
+    sbfetcher:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        image: superkeyor/sbfetcher:latest
+        container_name: sbfetcher
+        restart: unless-stopped
+        ports:
+            - "3000:3000"   # primary port
+            - "8191:3000"   # FlareSolverr conventional port alias (both point to same server)
+        environment:
+            HOST: "0.0.0.0"           # must stay 0.0.0.0 for container-to-container traffic over the Docker bridge; host exposure is controlled by port: above
+            PORT: "3000"              # port FastAPI listens on inside the container; must match :port above. need for healthcheck
+            PAGE_TIMEOUT: "30"        # seconds Playwright waits for a page to fully load before giving up
+            WAIT_AFTER_LOAD: "5"      # wait seconds for WAFs to settle before returning content
+            WINDOW_WIDTH: "1920"      # Xvfb virtual display width; realistic size reduces bot-detection risk
+            WINDOW_HEIGHT: "1080"     # Xvfb virtual display height
+            LOG_LEVEL: "INFO"
+            # Run Chrome via Xvfb virtual display instead of --headless.
+            # Non-headless mode bypasses most Cloudflare/bot-detection checks.
+            HEADED: "true"
+            # Optional: pass extra Chrome flags (space-separated)
+            # EXTRA_CHROME_ARGS: "--proxy-server=http://proxy:8080"
+        tmpfs:
+            # Chrome writes aggressively to /tmp; use tmpfs for performance + cleanup
+            - /tmp:size=512m,mode=1777
+        shm_size: "2gb"               # prevent Chrome /dev/shm OOM crashes
+        security_opt:
+            - no-new-privileges:true  # prevent processes gaining extra capabilities via setuid/setgid binaries
+        cap_drop:
+            - ALL                     # drop every default capability; only re-add what is strictly needed below
+        cap_add:
+            - SYS_ADMIN               # required for Chrome sandbox (user-namespace + seccomp) in containers
+        healthcheck:
+            test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s

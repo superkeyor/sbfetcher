@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
+# =============================================================================
+# start.sh — entrypoint for seleniumbase-fetcher container
+# =============================================================================
+set -euo pipefail
 
-# Start cron if enabled (set ARG ENABLE_CRON=true in Dockerfile or via --build-arg)
-if [ "$ENABLE_CRON" = "true" ]; then
-    cron  # no & needed; cron daemonizes itself
+echo "==> SeleniumBase Pure CDP Fetcher"
+echo "    Host:    ${HOST:-0.0.0.0}"
+echo "    Port:    ${PORT:-3000}"
+echo "    Timeout: ${PAGE_TIMEOUT:-30}s"
+echo "    Log:     ${LOG_LEVEL:-INFO}"
+
+# Verify Chrome is available before starting the server
+if ! command -v chromium-browser &>/dev/null; then
+    echo "ERROR: chromium-browser not found on PATH" >&2
+    exit 1
 fi
+echo "    Chrome:  $(chromium-browser --version 2>/dev/null)"
 
-if [ "$FLASK_ENV" = "development" ]; then
-    # flask provides debug, hot reload
-    python main.py
-else
-    # WSGI - Flask
-    # add gunicor/wsgi in front of flask
-    # gunicorn default to 8000
-    # main.py module : app = Flask(__name__) object
-    # connection timeout seconds
-    gunicorn --timeout 60 --bind 0.0.0.0:5000 main:app
-
-    # ASGI - FastAPI
-    # uvicorn main:app --host 0.0.0.0 --port 80 --timeout-keep-alive 60
-fi
+exec python /app/server.py
