@@ -1,0 +1,33 @@
+# Cron jobs for the container
+# Timezone is set by the TZ env var in the Dockerfile
+#
+# Format: minute hour day-of-month month day-of-week command
+#   *  *  *  *  *  command
+#   |  |  |  |  |
+#   |  |  |  |  +---- day of week  (0-7, Sunday=0 or 7)
+#   |  |  |  +------- month        (1-12)
+#   |  |  +---------- day of month (1-31)
+#   |  +------------- hour         (0-23)
+#   +---------------- minute       (0-59)
+#
+# Examples:
+#   Run every minute:
+#   * * * * * /opt/conda/envs/app/bin/python /app/job.py >> /var/log/cron.log 2>&1
+#
+#   Run daily at midnight:
+#   0 0 * * * /opt/conda/envs/app/bin/python /app/job.py >> /var/log/cron.log 2>&1
+#
+#   Run every hour:
+#   0 * * * * /opt/conda/envs/app/bin/python /app/job.py >> /var/log/cron.log 2>&1
+#
+# Debug (temporary): verify cron is running and environment is correct
+# * * * * * date -Is >> /var/log/cron_test.log 2>&1
+# * * * * * whoami >> /var/log/cron_test.log 2>&1
+# * * * * * pwd >> /var/log/cron_test.log 2>&1
+# * * * * * /opt/conda/envs/app/bin/python -V >> /var/log/cron_test.log 2>&1
+# * * * * * /opt/conda/envs/app/bin/python -c "import os,sys; print('exe='+sys.executable, 'cwd='+os.getcwd())" >> /var/log/cron_test.log 2>&1
+#
+# Add your cron jobs below this line:
+
+
+# Required empty line follows

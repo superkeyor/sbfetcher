@@ -1,0 +1,30 @@
+# ==============================================================================
+# SECURITY NOTE: Environment variables are defined here directly, not in a .env file,
+# to prevent accidental exposure through misconfigured servers or backups.
+#
+# WARNING: This file contains plain text secrets. DO NOT commit to version control.
+# Keep only on the production server with restricted permissions.
+# ==============================================================================
+services:
+    myapp:
+        image: myapp:latest
+        container_name: myapp
+        restart: always
+        ports:
+            - "127.0.0.1:5000:5000"
+        environment:
+            - FLASK_ENV=production
+            # Format: postgresql://USER:PASSWORD@HOST:PORT/NAME  (HOST is service/container name for Docker built-in DNS)
+            - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@myapp_db:5432/myapp
+        depends_on:
+            - myapp_db
+    myapp_db:
+        image: postgres:18-alpine
+        container_name: myapp_db
+        restart: always
+        environment:
+            POSTGRES_USER: ${DB_USER}
+            POSTGRES_PASSWORD: ${DB_PASSWORD}
+            POSTGRES_DB: myapp
+        volumes:
+            - /data/myapp/db:/var/lib/postgresql/data # Production system path

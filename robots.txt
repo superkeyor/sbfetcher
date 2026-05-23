@@ -1,0 +1,6 @@
+# robots.txt generated at http://www.mcanerin.com/EN/search-engine/robots-txt.asp
+# refuse all robots
+User-agent: *
+Disallow: /
+# User-agent: ia_archiver
+# Disallow: /
