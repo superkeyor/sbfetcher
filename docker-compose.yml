@@ -109,6 +109,9 @@ services:
             # Not use the 'check version' / telemetry service
             - DISABLE_VERSION_CHECK=true
             
+            # Allow fetching URLs that resolve to private/reserved IP ranges (e.g. Cloudflare-proxied sites).
+            - ALLOW_IANA_RESTRICTED_ADDRESSES=true
+            
             - TZ=America/Chicago
             - LC_ALL=C.UTF-8  # en_US.UTF-8 requires locales package
         
