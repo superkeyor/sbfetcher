@@ -25,6 +25,52 @@
 # ============================================================================
 
 services:
+    # NOTE: sbfetcher must be listed first — service definition order
+    # determines file-descriptor numbering for dup() in start.sh.
+    # --------------------------------------------------------------------------
+    # SeleniumBase + FastAPI headless Chrome fetcher
+    # --------------------------------------------------------------------------
+    sbfetcher:
+        image: superkeyor/sbfetcher:latest
+        container_name: sbfetcher
+        restart: unless-stopped
+        ports:
+            - "3000:3000"   # primary port
+            - "8191:3000"   # FlareSolverr conventional port alias (both point to same server)
+        environment:
+            HOST: "0.0.0.0"           # must stay 0.0.0.0 for container-to-container traffic over the Docker bridge; host exposure is controlled by port: above
+            PORT: "3000"              # port FastAPI listens on inside the container; must match :port above. need for healthcheck
+            PAGE_TIMEOUT: "30"        # seconds Playwright waits for a page to fully load before giving up
+            WAIT_AFTER_LOAD: "5"      # wait seconds for WAFs to settle before returning content
+            WINDOW_WIDTH: "1920"      # Xvfb virtual display width; realistic size reduces bot-detection risk
+            WINDOW_HEIGHT: "1080"     # Xvfb virtual display height
+            LOG_LEVEL: "INFO"
+            # Run Chrome via Xvfb virtual display instead of --headless.
+            # Non-headless mode bypasses most Cloudflare/bot-detection checks.
+            HEADED: "true"
+            # Optional: pass extra Chrome flags (space-separated)
+            # EXTRA_CHROME_ARGS: "--proxy-server=http://proxy:8080"
+            # Debug snapshots: set to "true" to save HTML+PNG to DEBUG_SNAPSHOT_DIR after every request.
+            # WARNING: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which is on the tmpfs below
+            # (RAM-only, wiped on restart). Override to a volume path to persist across restarts.
+            DEBUG_SNAPSHOT: "false"
+            DEBUG_SNAPSHOT_DIR: "/tmp/sbfetcher"
+        tmpfs:
+            # Chrome writes aggressively to /tmp; use tmpfs for performance + cleanup
+            - /tmp:size=512m,mode=1777
+        shm_size: "2gb"               # prevent Chrome /dev/shm OOM crashes
+        security_opt:
+            - no-new-privileges:true  # prevent processes gaining extra capabilities via setuid/setgid binaries
+        cap_drop:
+            - ALL                     # drop every default capability; only re-add what is strictly needed below
+        cap_add:
+            - SYS_ADMIN               # required for Chrome sandbox (user-namespace + seccomp) in containers
+        healthcheck:
+            test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 20s
     # --------------------------------------------------------------------------
     # changedetection.io
     # --------------------------------------------------------------------------
@@ -75,51 +121,3 @@ services:
             timeout: 10s
             retries: 3
             start_period: 30s
-
-    # --------------------------------------------------------------------------
-    # SeleniumBase + FastAPI headless Chrome fetcher
-    # --------------------------------------------------------------------------
-    sbfetcher:
-        build:
-            context: .
-            dockerfile: Dockerfile
-        image: superkeyor/sbfetcher:latest
-        container_name: sbfetcher
-        restart: unless-stopped
-        ports:
-            - "3000:3000"   # primary port
-            - "8191:3000"   # FlareSolverr conventional port alias (both point to same server)
-        environment:
-            HOST: "0.0.0.0"           # must stay 0.0.0.0 for container-to-container traffic over the Docker bridge; host exposure is controlled by port: above
-            PORT: "3000"              # port FastAPI listens on inside the container; must match :port above. need for healthcheck
-            PAGE_TIMEOUT: "30"        # seconds Playwright waits for a page to fully load before giving up
-            WAIT_AFTER_LOAD: "5"      # wait seconds for WAFs to settle before returning content
-            WINDOW_WIDTH: "1920"      # Xvfb virtual display width; realistic size reduces bot-detection risk
-            WINDOW_HEIGHT: "1080"     # Xvfb virtual display height
-            LOG_LEVEL: "INFO"
-            # Run Chrome via Xvfb virtual display instead of --headless.
-            # Non-headless mode bypasses most Cloudflare/bot-detection checks.
-            HEADED: "true"
-            # Optional: pass extra Chrome flags (space-separated)
-            # EXTRA_CHROME_ARGS: "--proxy-server=http://proxy:8080"
-            # Debug snapshots: set to "true" to save HTML+PNG to DEBUG_SNAPSHOT_DIR after every request.
-            # WARNING: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which is on the tmpfs below
-            # (RAM-only, wiped on restart). Override to a volume path to persist across restarts.
-            DEBUG_SNAPSHOT: "false"
-            DEBUG_SNAPSHOT_DIR: "/tmp/sbfetcher"
-        tmpfs:
-            # Chrome writes aggressively to /tmp; use tmpfs for performance + cleanup
-            - /tmp:size=512m,mode=1777
-        shm_size: "2gb"               # prevent Chrome /dev/shm OOM crashes
-        security_opt:
-            - no-new-privileges:true  # prevent processes gaining extra capabilities via setuid/setgid binaries
-        cap_drop:
-            - ALL                     # drop every default capability; only re-add what is strictly needed below
-        cap_add:
-            - SYS_ADMIN               # required for Chrome sandbox (user-namespace + seccomp) in containers
-        healthcheck:
-            test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
-            interval: 30s
-            timeout: 10s
-            retries: 3
-            start_period: 20s
