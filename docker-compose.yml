@@ -16,7 +16,12 @@
 #
 # changedetection.io integration:
 #   Playwright fetch:   PLAYWRIGHT_DRIVER_URL=ws://sbfetcher:3000/cdp
-#   (FLARESOLVERR_URL is NOT supported by changedetection.io v0.55.5 - env var is ignored)
+#                       (already set below; select "Playwright Chromium/Javascript" per watch)
+#   FlareSolverr:       NOT supported by changedetection.io in any form.
+#                       FLARESOLVERR_URL env var is silently ignored.
+#                       Using /v1 as an HTTP proxy also fails (ERR_TUNNEL_CONNECTION_FAILED)
+#                       because FlareSolverr is an API, not an HTTP CONNECT proxy.
+#                       See: https://github.com/dgtlmoon/changedetection.io/discussions/2445
 # ============================================================================
 
 services:
@@ -59,7 +64,7 @@ services:
             - DISABLE_VERSION_CHECK=true
             
             - TZ=America/Chicago
-            - LC_ALL=en_US.UTF-8
+            - LC_ALL=C.UTF-8  # en_US.UTF-8 requires locales package
         
         depends_on:
             sbfetcher:

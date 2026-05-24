@@ -13,15 +13,20 @@ Endpoints (browserless v1/v2 compatible):
   GET  /metrics              -> basic stats (requests, errors, uptime)
 
 FlareSolverr-compatible endpoint:
+  NOT supported by changedetection.io in any form — see notes below.
+  Intended for direct API consumers that speak the FlareSolverr API
+  (e.g. Prowlarr, Radarr, or any app with native FlareSolverr support).
   POST /v1  -> { cmd: "request.get", url, [maxTimeout, cookies, screenshot] }
-           -> { status, message, solution: { url, response, cookies, userAgent, screenshot? } }
+            -> { status, message, solution: { url, response, cookies, userAgent, screenshot? } }
   POST /v1  -> { cmd: "sessions.create" }  -> { session }
   POST /v1  -> { cmd: "sessions.list" }    -> { sessions }
   POST /v1  -> { cmd: "sessions.destroy", session }
 
 changedetection.io integration:
-  FlareSolverr path: set FLARESOLVERR_URL=http://<host>:3000
-                     use "FlareSolverr" fetch method per watch
+  Playwright CDP:   PLAYWRIGHT_DRIVER_URL=ws://<host>:3000/cdp
+                    Select "Playwright Chromium/Javascript" fetch method per watch
+  Note: FLARESOLVERR_URL is NOT supported by changedetection.io in any form; proxy-based
+        FlareSolverr integration is not available — use PLAYWRIGHT_DRIVER_URL.
 """
 
 import asyncio
@@ -48,7 +53,7 @@ from pydantic import BaseModel, Field
 from seleniumbase import cdp_driver
 
 # FlareSolverr version string reported in /v1 responses
-FLARESOLVERR_VERSION = "v3.3.21"
+FLARESOLVERR_VERSION = "v3.4.6"
 
 # ---------------------------------------------------------------------------
 # Config (env-overridable)
@@ -58,21 +63,35 @@ LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
 HOST         = os.getenv("HOST", "0.0.0.0")
 PORT         = int(os.getenv("PORT", "3000"))
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30"))      # seconds
-WAIT_AFTER   = float(os.getenv("WAIT_AFTER_LOAD", "1"))  # extra settle time (seconds)
-WINDOW_W     = int(os.getenv("WINDOW_WIDTH", "1280"))
-WINDOW_H     = int(os.getenv("WINDOW_HEIGHT", "900"))
+WAIT_AFTER   = float(os.getenv("WAIT_AFTER_LOAD", "5"))  # extra settle time (seconds)
+WINDOW_W     = int(os.getenv("WINDOW_WIDTH", "1920"))
+WINDOW_H     = int(os.getenv("WINDOW_HEIGHT", "1080"))
 CHROME_ARGS  = os.getenv("EXTRA_CHROME_ARGS", "")        # space-separated extra flags
 # Set HEADED=true to run Chrome in a virtual Xvfb display (useful for debugging)
-HEADED       = os.getenv("HEADED", "false").lower() in ("1", "true", "yes")
-# Optional persistent Chrome profile dir; empty string = ephemeral temp profile each restart
-CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "") or None
+HEADED       = os.getenv("HEADED", "true").lower() in ("1", "true", "yes")
+# Persistent Chrome profile dir; matches CHROME_USER_DATA_DIR in Dockerfile
+CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile") or None
+# Set DEBUG_SNAPSHOT=false to disable; snapshots land in DEBUG_SNAPSHOT_DIR.
+DEBUG_SNAPSHOT     = os.getenv("DEBUG_SNAPSHOT", "false").lower() in ("1", "true", "yes")
+DEBUG_SNAPSHOT_DIR = os.getenv("DEBUG_SNAPSHOT_DIR", "/tmp/sbfetcher")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("sbfetcher")
 
 # ---------------------------------------------------------------------------
 # CDP browser state
-# Pure CDP Mode: one persistent driver + tab, serialized via asyncio.Lock.
+#
+# A SINGLE Chrome process is launched at server startup (lifespan) and reused
+# for every request — no new browser is spawned per request.
+#
+# All requests share ONE tab (_tab), which is simply navigated to the new URL
+# via tab.get(url) for each request.  _driver_lock (asyncio.Lock) serializes
+# concurrent requests so only one navigation runs at a time.
+#
+# The browser is only relaunched when the tab appears dead (detected in
+# _get_or_restart_browser by a failed get_current_url() ping).  Because the
+# session persists across requests, cookies and profile state are retained.
+#
 # cdp_driver speaks directly to Chrome over CDP — no WebDriver, no chromedriver.
 # ---------------------------------------------------------------------------
 
@@ -287,6 +306,400 @@ class FetchResponse(BaseModel):
 # All functions must be called while holding _driver_lock.
 # ---------------------------------------------------------------------------
 
+
+async def _solve_captcha_if_present(tab: Any) -> bool:
+    """
+    Detect and click common CAPTCHA challenges after page load.
+    Mimics CDPMethods.solve_captcha() / __click_captcha(use_cdp=True).
+    Uses raw async tab API to avoid event-loop conflict with FastAPI.
+
+    Handles:
+        - Cloudflare Turnstile (CSS alignment fix + offset click 25,32)
+        - reCAPTCHA v2 (skips invisible bottom-right widget, offset 26,35)
+        - hCaptcha / Incapsula hCaptcha (offset 30,36)
+        - FriendlyCaptcha (offset 27,34 with mouse_move)
+        - DataDome slider (detected, not solved — requires GUI drag)
+
+    Returns True if a challenge was found and a click was attempted.
+    """
+
+    # --- async helpers (async equivalents of CDPMethods private helpers) ----
+
+    async def _is_present(sel: str) -> bool:
+        try:
+            return (await tab.select(sel, timeout=0.1)) is not None
+        except Exception:
+            return False
+
+    async def _is_visible(sel: str) -> bool:
+        try:
+            el = await tab.select(sel, timeout=0.1)
+            if el is None:
+                return False
+            pos = await el.get_position_async()
+            return pos.width != 0 or pos.height != 0
+        except Exception:
+            return False
+
+    async def _cdp_click_offset(sel: str, x_off: int, y_off: int) -> bool:
+        """Async equiv of: bring_active_window_to_front() + click_with_offset(sel,x,y)"""
+        try:
+            el = await tab.select(sel, timeout=2)
+            if el is None:
+                return False
+            await el.scroll_into_view_async()
+            await tab.bring_to_front()
+            await tab.sleep(0.056)
+            await el.mouse_click_with_offset_async(x_off, y_off)
+            await tab.sleep(0.2)
+            return True
+        except Exception as exc:
+            log.debug(
+                "solve_captcha: click_offset(%r, %s, %s) failed: %s",
+                sel, x_off, y_off, exc,
+            )
+            return False
+
+    # --- initial settle (mirrors __click_captcha preamble) ------------------
+    await tab.sleep(0.1)
+    await tab.sleep(0.1)
+
+    try:
+        source = await tab.get_page_source()
+    except Exception:
+        return False
+
+    # --- CF Turnstile detection (mirrors _on_a_cf_turnstile_page) -----------
+    is_cf = (
+        "cf-turnstile-" in source
+        or "/challenge-platform/h/b/" in source
+        or 'id="challenge-widget-' in source
+        or "challenges.cloudf" in source
+        or (
+            'data-callback="onCaptchaSuccess"' in source
+            and 'title="reCAPTCHA"' not in source
+            and 'id="recaptcha-token"' not in source
+        )
+    )
+
+    if not is_cf:
+        # --- reCAPTCHA detection (mirrors _on_a_g_recaptcha_page) -----------
+        # reCAPTCHA may need a moment to appear after page load
+        await tab.sleep(0.4)
+        await tab.sleep(0.1)
+        source = await tab.get_page_source()
+        recaptcha_in_source = (
+            'id="recaptcha-token"' in source or 'title="reCAPTCHA"' in source
+        )
+        is_recaptcha = (
+            recaptcha_in_source
+            and await _is_visible('iframe[title="reCAPTCHA"]')
+        )
+        if not is_recaptcha and "com/recaptcha/api.js" in source:
+            # API loaded but widget not yet rendered
+            await tab.sleep(1.2)
+            await tab.sleep(0.1)
+            is_recaptcha = await _is_visible('iframe[title="reCAPTCHA"]')
+
+        if is_recaptcha:
+            log.info("solve_captcha: reCAPTCHA detected")
+            await tab.sleep(0.25)
+            await tab.sleep(0.1)
+            await tab.sleep(0.25)
+            # Skip invisible reCAPTCHA in bottom-right corner
+            try:
+                el = await tab.select('iframe[title="reCAPTCHA"]', timeout=0.5)
+                pos = await el.get_position_async()
+                win_w = await tab.evaluate("window.innerWidth")
+                win_h = await tab.evaluate("window.innerHeight")
+                if (
+                    pos.x > 1040 and pos.y > 640
+                    and abs(win_w - pos.x) < 110
+                    and abs(win_h - pos.y) < 110
+                ):
+                    log.debug(
+                        "solve_captcha: skipping invisible reCAPTCHA "
+                        "(bottom-right corner)"
+                    )
+                    return False
+            except Exception:
+                pass
+            await tab.sleep(0.08)
+            await tab.sleep(0.03)
+            result = await _cdp_click_offset('iframe[title="reCAPTCHA"]', 26, 35)
+            if result:
+                log.info("solve_captcha: clicked reCAPTCHA")
+            return result
+
+        # --- hCaptcha detection (mirrors _on_an_incapsula_hcaptcha_page) ---
+        await tab.sleep(0.1)
+        is_hcaptcha = (
+            await _is_visible('iframe[src*="_Incapsula_Resource?"]')
+            or await _is_visible("iframe[data-hcaptcha-widget-id]")
+        )
+        if is_hcaptcha:
+            log.info("solve_captcha: hCaptcha detected")
+            await tab.sleep(0.05)
+            await tab.sleep(0.1)
+            await tab.sleep(0.05)
+            if await _is_visible('iframe[src*="_Incapsula_Resource?"]'):
+                try:
+                    outer = await tab.select(
+                        'iframe[src*="_Incapsula_Resource?"]', timeout=0.5
+                    )
+                    inner = await outer.query_selector_async(
+                        "iframe[data-hcaptcha-widget-id]"
+                    )
+                    if not inner:
+                        return False
+                    await tab.bring_to_front()
+                    await tab.sleep(0.056)
+                    await inner.mouse_click_with_offset_async(30, 36)
+                    await tab.sleep(0.075)
+                    await tab.sleep(0.75)
+                    log.info("solve_captcha: clicked nested hCaptcha")
+                    return True
+                except Exception as exc:
+                    log.debug(
+                        "solve_captcha: nested hCaptcha click failed: %s", exc
+                    )
+                    return False
+            else:
+                el = None
+                try:
+                    el = await tab.select(
+                        "iframe[data-hcaptcha-widget-id]", timeout=0.5
+                    )
+                except Exception:
+                    pass
+                if not el:
+                    return False
+                await tab.bring_to_front()
+                await tab.sleep(0.056)
+                await el.mouse_click_with_offset_async(30, 36)
+                await tab.sleep(0.075)
+                await tab.sleep(0.75)
+                log.info("solve_captcha: clicked hCaptcha")
+                return True
+
+        # --- DataDome: detected but not handled (requires slider drag) ------
+        await tab.sleep(0.05)
+        if await _is_visible(
+            'body > iframe[src*="/geo.captcha-delivery.com/captcha/"]',
+        ):
+            log.warning(
+                "solve_captcha: DataDome slider detected — "
+                "not supported (requires GUI drag)"
+            )
+            return False
+
+        # --- FriendlyCaptcha (mirrors __gui_click_friendly_captcha(use_cdp=True)) ---
+        await tab.sleep(0.05)
+        if await _is_visible("iframe[data--frc-frame-id]"):
+            log.info("solve_captcha: FriendlyCaptcha detected")
+            await tab.sleep(0.05)
+            await tab.sleep(0.1)
+            await tab.sleep(0.05)
+            try:
+                el = await tab.select("iframe[data--frc-frame-id]", timeout=0.5)
+                if not el:
+                    return False
+                pos = await el.get_position_async()
+                win_w = await tab.evaluate("window.innerWidth")
+                win_h = await tab.evaluate("window.innerHeight")
+                if (
+                    pos.x > 1040 and pos.y > 640
+                    and abs(win_w - pos.x) < 110
+                    and abs(win_h - pos.y) < 110
+                ):
+                    log.debug(
+                        "solve_captcha: skipping bottom-right FriendlyCaptcha"
+                    )
+                    return False
+                await tab.sleep(0.08)
+                await tab.sleep(0.03)
+                await tab.bring_to_front()
+                await tab.sleep(0.06)
+                await el.mouse_move_async()
+                await tab.sleep(0.08)
+                await el.mouse_click_with_offset_async(27, 34)
+                await tab.sleep(0.08)
+                await el.mouse_move_async()
+                await tab.sleep(0.25)
+                log.info("solve_captcha: clicked FriendlyCaptcha")
+                return True
+            except Exception as exc:
+                log.debug(
+                    "solve_captcha: FriendlyCaptcha click failed: %s", exc
+                )
+                return False
+
+        return False  # nothing detected
+
+    # --- Cloudflare Turnstile handler (only reached when is_cf) -------------
+    log.info("solve_captcha: CF Turnstile detected")
+
+    # Find the right selector (mirrors __click_captcha if/elif chain)
+    cf_selector = None
+    for candidate in [
+        '[class="cf-turnstile"]',
+        "#challenge-form div > div",
+        '[style="display: grid;"] div div',
+        '[class*=spacer] + div div',
+        ".spacer div:not([class])",
+        '[data-testid*="challenge-"] div',
+        "div#turnstile-widget div:not([class])",
+        "ngx-turnstile div:not([class])",
+        'form div:not([class]):has(input[name*="cf-turn"])',
+        "body > div#check > div:not([class])",
+        ".cf-turnstile-wrapper",
+        '[id*="turnstile"] div:not([class])',
+        '[class*="turnstile"] div:not([class])',
+        "iframe[data-hcaptcha-widget-id]",
+        '[data-callback="onCaptchaSuccess"]',
+        '[class*="captcha"] div:not([class])',
+        "form div:not(:has(*))",
+        (
+            "div:not([class]):not([id]):not([aria-label]) > "
+            "div:not([class]):not([id]):not([aria-label])"
+        ),
+    ]:
+        if await _is_present(candidate):
+            cf_selector = candidate
+            # Inline CSS fix for grid layout
+            if candidate == '[style="display: grid;"] div div':
+                try:
+                    await tab.evaluate(
+                        "var $e=document.querySelectorAll("
+                        "'[style=\"display: grid;\"] div div');"
+                        "for(var i=0;i<$e.length;i++){"
+                        "$e[i].setAttribute('style','text-align:left;');}"
+                    )
+                    await tab.sleep(0.025)
+                except Exception:
+                    pass
+            break
+
+    if not cf_selector:
+        log.warning(
+            "solve_captcha: CF Turnstile detected in source "
+            "but no clickable element found"
+        )
+        return False
+
+    # CSS alignment fixes (center/right → left) — mirrors elif chain
+    try:
+        if (
+            await _is_present('form[class*="center"]')
+            or await _is_present('form[class*="right"]')
+            or await _is_present('form div[class*="center"]')
+            or await _is_present('form div[class*="right"]')
+        ):
+            await tab.evaluate(
+                "var $e=document.querySelectorAll('form[class], form div[class]');"
+                "for(var i=0;i<$e.length;i++){"
+                "var c=$e[i].getAttribute('class');"
+                "c=c.replaceAll('center','left').replaceAll('right','left');"
+                "$e[i].setAttribute('class',c);}"
+            )
+            await tab.sleep(0.1)
+        elif (
+            await _is_present('form div[style*="center"]')
+            or await _is_present('form div[style*="right"]')
+        ):
+            await tab.evaluate(
+                "var $e=document.querySelectorAll('form[style], form div[style]');"
+                "for(var i=0;i<$e.length;i++){"
+                "var s=$e[i].getAttribute('style');"
+                "s=s.replaceAll('center','left').replaceAll('right','left');"
+                "$e[i].setAttribute('style',s);}"
+            )
+            await tab.sleep(0.1)
+        elif (
+            await _is_present('form [id*="turnstile"] div:not([class])')
+            or await _is_present('form [class*="turnstile"] div:not([class])')
+        ):
+            await tab.evaluate(
+                "var $e=document.querySelectorAll('form [id*=\"turnstile\"]');"
+                "for(var i=0;i<$e.length;i++){$e[i].setAttribute('align','left');}"
+                "var $e=document.querySelectorAll('form [class*=\"turnstile\"]');"
+                "for(var i=0;i<$e.length;i++){$e[i].setAttribute('align','left');}"
+            )
+            await tab.sleep(0.1)
+        elif await _is_present('[style*="text-align: center;"] div:not([class])'):
+            await tab.evaluate(
+                "var $e=document.querySelectorAll('[style*=\"text-align: center;\"]');"
+                "for(var i=0;i<$e.length;i++){"
+                "var s=$e[i].getAttribute('style');"
+                "s=s.replaceAll('center','left');"
+                "$e[i].setAttribute('style',s);}"
+            )
+            await tab.sleep(0.1)
+    except Exception as exc:
+        log.debug(
+            "solve_captcha: CSS alignment fix failed (non-fatal): %s", exc
+        )
+
+    await tab.sleep(0.05)
+    await tab.sleep(0.03)
+    result = await _cdp_click_offset(cf_selector, 25, 32)
+    if result:
+        await tab.sleep(5)  # wait for challenge resolution
+        log.info("solve_captcha: clicked CF Turnstile (%r)", cf_selector)
+    return result
+
+async def _save_debug_snapshot(
+    tab: Any, url: str, html: str | None = None, png_bytes: bytes | None = None
+) -> None:
+    """
+    Save an HTML page source and a PNG screenshot to DEBUG_SNAPSHOT_DIR.
+    Non-fatal — any exception is logged at WARNING level only.
+    Controlled by the DEBUG_SNAPSHOT env var (default: true).
+    """
+    if not DEBUG_SNAPSHOT:
+        return
+    try:
+        os.makedirs(DEBUG_SNAPSHOT_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        host = urlparse(url).hostname or "unknown"
+        safe_host = "".join(c if c.isalnum() or c in "-_" else "_" for c in host)
+        base = os.path.join(DEBUG_SNAPSHOT_DIR, f"{ts}_{safe_host}")
+
+        # -- HTML ---------------------------------------------------------
+        if html is None:
+            try:
+                html = await tab.get_page_source()
+            except Exception:
+                pass
+        if html:
+            html_path = f"{base}.html"
+            with open(html_path, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(html)
+            log.debug("Debug snapshot HTML: %s", html_path)
+
+        # -- Screenshot ---------------------------------------------------
+        if png_bytes is None:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                await tab.save_screenshot(filename=tmp_path)
+                with open(tmp_path, "rb") as fh:
+                    png_bytes = fh.read()
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        if png_bytes:
+            png_path = f"{base}.png"
+            with open(png_path, "wb") as fh:
+                fh.write(png_bytes)
+            log.debug("Debug snapshot PNG: %s", png_path)
+
+    except Exception as exc:
+        log.warning("_save_debug_snapshot failed (non-fatal): %s", exc)
+
+
 async def _cdp_navigate(tab: Any, req: FetchRequest) -> None:
     """
     Apply request options (viewport, user-agent, headers, cookies) and
@@ -326,6 +739,9 @@ async def _cdp_navigate(tab: Any, req: FetchRequest) -> None:
     if extra_s > 0:
         await tab.sleep(extra_s)
 
+    # Attempt to solve any CAPTCHA challenge present after page load
+    await _solve_captcha_if_present(tab)
+
     # Wait for a CSS selector if requested
     if req.waitForSelector:
         try:
@@ -350,6 +766,7 @@ async def _do_fetch(req: FetchRequest) -> tuple[str, str]:
     await _cdp_navigate(tab, req)
     html = await tab.get_page_source()
     final_url = await tab.get_current_url()
+    await _save_debug_snapshot(tab, final_url, html=html)
     return html, final_url
 
 
@@ -377,6 +794,8 @@ async def _do_screenshot(req: ScreenshotRequest) -> bytes:
         png_bytes = f.read()
 
     os.unlink(tmp_path)
+
+    await _save_debug_snapshot(tab, req.url, png_bytes=png_bytes)
 
     # Convert to JPEG if requested
     if req.type == "jpeg":
@@ -443,6 +862,9 @@ async def _do_flaresolverr_fetch(req: "FlareSolverrRequest") -> dict:
     # Settle
     await tab.sleep(WAIT_AFTER)
 
+    # Attempt to solve any CAPTCHA challenge present
+    await _solve_captcha_if_present(tab)
+
     # Collect results
     html = await tab.get_page_source()
     final_url = await tab.get_current_url()
@@ -487,6 +909,7 @@ async def _do_flaresolverr_fetch(req: "FlareSolverrRequest") -> dict:
             solution["screenshot"] = base64.b64encode(f.read()).decode()
         os.unlink(tmp_path)
 
+    await _save_debug_snapshot(tab, final_url, html=html)
     return solution
 
 
@@ -686,9 +1109,15 @@ async def flaresolverr_v1(req: FlareSolverrRequest):
     FlareSolverr-compatible /v1 endpoint.
     Supports: request.get, sessions.create, sessions.list, sessions.destroy
 
-    changedetection.io usage:
-      Set FLARESOLVERR_URL=http://<this-host>:3000
-      Use the "FlareSolverr" fetch method per watch.
+    Intended for direct API consumers that speak the FlareSolverr API
+    (e.g. Prowlarr, Radarr, or any app with native FlareSolverr support).
+
+    changedetection.io does NOT support FlareSolverr in any form:
+      - FLARESOLVERR_URL env var is silently ignored (dgtlmoon/changedetection.io#2445).
+      - Configuring http://<host>:3000 as an HTTP proxy also fails
+        (ERR_TUNNEL_CONNECTION_FAILED) — FlareSolverr is an API, not an
+        HTTP CONNECT proxy.
+    Use PLAYWRIGHT_DRIVER_URL=ws://<host>:3000/cdp instead.
     """
     start_ts = int(time.time() * 1000)
     _stats["requests"] += 1
