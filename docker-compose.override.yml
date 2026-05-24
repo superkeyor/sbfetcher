@@ -7,3 +7,10 @@ services:
     changedetection:
         ports:
             - "5555:5000"
+
+    sbfetcher:
+        environment:
+            DEBUG_SNAPSHOT: "true"
+            DEBUG_SNAPSHOT_DIR: "/root/snapshot"
+        volumes:
+            - ~/snapshot:/root/snapshot
