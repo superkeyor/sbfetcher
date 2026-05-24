@@ -42,6 +42,12 @@ ENV HEADED=true
 ENV CHROME_USER_DATA_DIR=/app/chromiumprofile
 # Extra space-separated Chrome flags, e.g. --proxy-server=http://proxy:8080
 ENV EXTRA_CHROME_ARGS=""
+# Debug snapshots: set DEBUG_SNAPSHOT=true to save HTML+PNG after every request.
+# NOTE: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which lives on the tmpfs
+# mount defined in docker-compose.yml — snapshots are RAM-only and lost on restart.
+# Override DEBUG_SNAPSHOT_DIR to a volume-backed path to persist them.
+ENV DEBUG_SNAPSHOT=false
+ENV DEBUG_SNAPSHOT_DIR=/tmp/sbfetcher
 
 # =============================================================================
 # System Dependencies

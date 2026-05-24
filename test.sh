@@ -4,7 +4,7 @@
 # Override the base URL:  BASE_URL=http://my-host:3000
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
-URL="https://example.com"
+URL="https://bot.sannysoft.com"   # "https://nowsecure.nl/#relax"
 
 # ---------------------------------------------------------------------------
 # GET /health
@@ -29,12 +29,12 @@ curl -s -X POST "$BASE_URL/content" \
   -d "{\"url\": \"$URL\", \"waitForTimeout\": 1000, \"javascript\": \"document.title\"}" | jq '{url, length: (.data | length)}'
 
 # ---------------------------------------------------------------------------
-# POST /screenshot  (save to /tmp/shot.png)
+# POST /screenshot  (save to ./snapshot.png)
 # ---------------------------------------------------------------------------
 curl -s -X POST "$BASE_URL/screenshot" \
   -H "Content-Type: application/json" \
   -d "{\"url\": \"$URL\"}" \
-  -o /tmp/shot.png && echo "Saved /tmp/shot.png ($(wc -c < /tmp/shot.png) bytes)"
+  -o ./snapshot.png && echo "Saved ./snapshot.png ($(wc -c < ./snapshot.png) bytes)"
 
 # ---------------------------------------------------------------------------
 # POST /v1 — sessions.create

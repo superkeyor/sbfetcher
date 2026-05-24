@@ -102,6 +102,11 @@ services:
             HEADED: "true"
             # Optional: pass extra Chrome flags (space-separated)
             # EXTRA_CHROME_ARGS: "--proxy-server=http://proxy:8080"
+            # Debug snapshots: set to "true" to save HTML+PNG to DEBUG_SNAPSHOT_DIR after every request.
+            # WARNING: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which is on the tmpfs below
+            # (RAM-only, wiped on restart). Override to a volume path to persist across restarts.
+            DEBUG_SNAPSHOT: "false"
+            DEBUG_SNAPSHOT_DIR: "/tmp/sbfetcher"
         tmpfs:
             # Chrome writes aggressively to /tmp; use tmpfs for performance + cleanup
             - /tmp:size=512m,mode=1777
