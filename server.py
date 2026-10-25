@@ -14,11 +14,16 @@ Stealth on the /cdp path:
   - Playwright's new_context() is mapped onto Chrome's default (persistent)
     browser context, so every check reuses the profile's cookies, including
     Cloudflare's cf_clearance (CDP_SHARE_DEFAULT_CONTEXT).
-  - A background warm-up task visits WARMUP_URLS with the server-side
-    CAPTCHA solver to keep cf_clearance fresh.
+  - Smart warm-up: the relay remembers, per host, whether its last visit hit a
+    bot check. A new host, or one that failed last time, is first visited at its
+    site root in the server's own tab (CAPTCHA solver + a little human-like
+    scrolling) before the client's navigation is released; a host that went
+    through cleanly is fetched directly.  Hosts that fail repeatedly are always
+    warmed.  State lives in the Chrome profile folder (see WARMUP_STATE_FILE).
 """
 
 import asyncio
+import ipaddress
 import itertools
 import json
 import logging
@@ -58,9 +63,20 @@ HEADED         = os.getenv("HEADED", "true").lower() in ("1", "true", "yes")
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile") or None
 # Map Playwright's new_context() onto the default (persistent) browser context.
 CDP_SHARE_DEFAULT_CONTEXT = os.getenv("CDP_SHARE_DEFAULT_CONTEXT", "true").lower() in ("1", "true", "yes")
-# Comma-separated URLs revisited every WARMUP_INTERVAL minutes to keep cf_clearance fresh.
-WARMUP_URLS     = [u.strip() for u in os.getenv("WARMUP_URLS", "").split(",") if u.strip()]
-WARMUP_INTERVAL = float(os.getenv("WARMUP_INTERVAL", "60"))
+# Master switch for the whole warm-up feature (see the module docstring). WARMUP=false disables all of it:
+# no warm-up visits, no learning from 403/429/503 responses, no state file. /cdp then just relays to Chrome.
+WARMUP          = os.getenv("WARMUP", "true").lower() in ("1", "true", "yes")
+# Skip a needed warm-up if the host was warmed less than this many seconds ago
+# (checks that arrive together share one warm-up). 0 = warm up whenever needed.
+WARMUP_COOLDOWN = float(os.getenv("WARMUP_COOLDOWN", "300"))
+# A host that failed this many direct visits within WARMUP_ALWAYS_DAYS is warmed before every check.
+WARMUP_ALWAYS_AFTER = int(os.getenv("WARMUP_ALWAYS_AFTER", "2"))
+WARMUP_ALWAYS_DAYS  = float(os.getenv("WARMUP_ALWAYS_DAYS", "90"))
+# Per-host memory; default sits in the (persistent) Chrome profile folder. Empty path = in-memory only.
+WARMUP_STATE_FILE = os.getenv("WARMUP_STATE_FILE") or (
+    os.path.join(os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile"), "sbfetcher-hosts.json")
+    if os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile") else None
+)
 # Set DEBUG_SNAPSHOT=true to save HTML+PNG after every warm-up visit.
 DEBUG_SNAPSHOT     = os.getenv("DEBUG_SNAPSHOT", "false").lower() in ("1", "true", "yes")
 DEBUG_SNAPSHOT_DIR = os.getenv("DEBUG_SNAPSHOT_DIR", "/tmp/sbfetcher")
@@ -89,7 +105,12 @@ _driver_lock = asyncio.Lock()
 _xvfb_proc: Any = None         # Xvfb subprocess (only when HEADED=True)
 _chrome_debug_port: int | None = None  # Chrome remote debugging port
 _restart_task: asyncio.Task | None = None
-_warmup_task: asyncio.Task | None = None
+# Smart warm-up memory, keyed by host (see _host_key):
+#   {"needs_warmup": bool, "last_warm": epoch seconds, "fails": [epoch seconds of failed direct visits]}
+_hosts: dict[str, dict] = {}
+_last_warm: dict[str, float] = {}   # host -> time.monotonic() of its last successful warm-up (cooldown)
+_warming: set[str] = set()          # hosts being warmed right now (their 403s are ours, not a failure)
+_bg_tasks: set[asyncio.Task] = set()
 _start_time = time.time()
 
 
@@ -173,7 +194,7 @@ def _schedule_restart() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _xvfb_proc, _warmup_task
+    global _xvfb_proc
     # Startup: launch Xvfb virtual display when running headed
     if HEADED:
         import subprocess
@@ -189,16 +210,14 @@ async def lifespan(app: FastAPI):
     log.info("Starting Pure CDP Mode browser (headless=%s)...", not HEADED)
     async with _driver_lock:
         await _get_or_restart_browser()
-    if WARMUP_URLS:
-        _warmup_task = asyncio.create_task(_warmup_loop())
-        log.info("Warm-up every %s min: %s", WARMUP_INTERVAL, ", ".join(WARMUP_URLS))
+    if WARMUP:
+        _load_hosts()
+        log.info(
+            "Smart warm-up on: %d known host(s), state file %s", len(_hosts), WARMUP_STATE_FILE or "(memory only)"
+        )
     log.info("Server ready")
     yield
-    # Shutdown: stop the warm-up task and the browser process
-    if _warmup_task is not None:
-        _warmup_task.cancel()
-        await asyncio.gather(_warmup_task, return_exceptions=True)
-        _warmup_task = None
+    # Shutdown: stop the browser process
     global _cdp_driver, _tab
     if _cdp_driver:
         log.info("Stopping CDP browser")
@@ -696,33 +715,189 @@ async def _wait_for_cloudflare(tab: Any, timeout_s: float) -> str:
         await tab.sleep(1)
 
 
-async def _warm_url(tab: Any, url: str) -> None:
-    """Visit url and get through any Cloudflare check, refreshing cf_clearance."""
+async def _browse_like_a_human(tab: Any) -> None:
+    """Dwell and scroll a little, with trusted (gesture) scroll events."""
+    async def _scroll() -> None:
+        # A scroll gesture only completes while the tab renders, and a client's
+        # tab may be in front of ours in the same window.
+        await tab.bring_to_front()
+        await tab.sleep(random.uniform(0.8, 1.8))
+        for _ in range(random.randint(2, 3)):
+            await tab.scroll_down(random.randint(15, 40))
+            await tab.sleep(random.uniform(0.6, 1.6))
+        await tab.scroll_up(random.randint(10, 25))
+        await tab.sleep(random.uniform(0.4, 1.0))
+
+    try:
+        await asyncio.wait_for(_scroll(), timeout=15)
+    except Exception as exc:
+        log.warning("warm-up: scrolling failed (non-fatal): %r", exc)
+
+
+async def _warm_url(tab: Any, url: str) -> str:
+    """
+    Visit url, get through any bot check, then scroll around a little.
+    Takes about WARMUP_TIMEOUT seconds at most plus a few seconds of scrolling.
+    Returns the final _classify_page() state.
+    """
+    start = time.monotonic()
     # tab.get() has no timeout of its own (extra kwargs only change its code path)
     await asyncio.wait_for(tab.get(url), timeout=WARMUP_TIMEOUT)
-    state = await _wait_for_cloudflare(tab, WARMUP_TIMEOUT)
+    remaining = max(WARMUP_TIMEOUT - (time.monotonic() - start), 5)
+    state = await _wait_for_cloudflare(tab, remaining)
     final_url = await tab.get_current_url()
     if state == "ok":
-        log.info("warm-up: %s ok", final_url)
+        log.info("warm-up: %s ok (%.1fs)", final_url, time.monotonic() - start)
+        await _browse_like_a_human(tab)
     else:
-        log.warning("warm-up: %s still %s after %ss", url, state, WARMUP_TIMEOUT)
+        log.warning("warm-up: %s still %s after %.0fs", url, state, time.monotonic() - start)
     await _save_debug_snapshot(tab, final_url)
-    # Park the tab so it isn't running the site's scripts between rounds
-    await tab.get("about:blank")
+    # Park the tab so it isn't running the site's scripts in the background
+    try:
+        await asyncio.wait_for(tab.get("about:blank"), timeout=10)
+    except Exception as exc:
+        log.warning("warm-up: could not park the tab (non-fatal): %r", exc)
+    return state
 
 
-async def _warmup_loop() -> None:
-    """Revisit WARMUP_URLS every WARMUP_INTERVAL minutes (jittered)."""
-    while True:
-        for url in WARMUP_URLS:
-            try:
-                async with _driver_lock:
-                    tab = await _get_or_restart_browser()
-                    await _warm_url(tab, url)
-            except Exception:
-                log.exception("warm-up failed for %s", url)
-            await asyncio.sleep(random.uniform(2, 8))
-        await asyncio.sleep(WARMUP_INTERVAL * 60 * random.uniform(0.9, 1.1))
+def _warm_target(url: str) -> tuple[str, str] | None:
+    """
+    Return (host key, root URL) for a public http(s) URL, or None for URLs that are
+    never warmed: other schemes, localhost, LAN/private IPs, dotless and *.local hosts.
+    The key drops a leading "www." so www.example.com and example.com share a state.
+    """
+    try:
+        parts = urlparse(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not host or host == "localhost":
+        return None
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            return None
+    except ValueError:  # not an IP address: a hostname
+        if "." not in host or host.endswith((".local", ".lan", ".internal", ".localdomain", ".home.arpa")):
+            return None
+    root = f"{parts.scheme}://{host}{f':{port}' if port else ''}/"
+    return host.removeprefix("www."), root
+
+
+def _load_hosts() -> None:
+    """Load the per-host memory from WARMUP_STATE_FILE (missing or unreadable = start empty)."""
+    _hosts.clear()
+    if not WARMUP_STATE_FILE:
+        return
+    try:
+        with open(WARMUP_STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            _hosts.update({k: v for k, v in data.items() if isinstance(v, dict)})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log.warning("warm-up: could not read %s (starting empty): %s", WARMUP_STATE_FILE, exc)
+
+
+def _save_hosts() -> None:
+    """Write the per-host memory atomically. Never raises."""
+    if not WARMUP_STATE_FILE:
+        return
+    try:
+        tmp = f"{WARMUP_STATE_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_hosts, fh, indent=1, sort_keys=True)
+        os.replace(tmp, WARMUP_STATE_FILE)
+    except OSError as exc:
+        log.warning("warm-up: could not write %s: %s", WARMUP_STATE_FILE, exc)
+
+
+def _recent_fails(entry: dict) -> list[float]:
+    """Failed direct visits still inside the WARMUP_ALWAYS_DAYS window."""
+    cutoff = time.time() - WARMUP_ALWAYS_DAYS * 86400
+    return [t for t in entry.get("fails", []) if t >= cutoff]
+
+
+def _should_warm(host: str) -> bool:
+    """New host, one that failed last time, or a frequent challenger."""
+    entry = _hosts.get(host)
+    if entry is None:
+        return True
+    return bool(entry.get("needs_warmup")) or len(_recent_fails(entry)) >= WARMUP_ALWAYS_AFTER
+
+
+async def _warmup_host(host: str, root: str) -> None:
+    """
+    Visit the site root and record the outcome. Must be called while holding _driver_lock.
+    A clean warm-up means the next visit can go direct; a failed one is retried next time.
+    """
+    _warming.add(host)
+    try:
+        tab = await _get_or_restart_browser()
+        state = await _warm_url(tab, root)
+    finally:
+        _warming.discard(host)
+    entry = _hosts.setdefault(host, {})
+    entry["fails"] = _recent_fails(entry)
+    if state == "ok":
+        entry["needs_warmup"] = False
+        entry["last_warm"] = time.time()
+        _last_warm[host] = time.monotonic()
+    else:
+        entry["needs_warmup"] = True
+    _save_hosts()
+
+
+async def _warm_if_needed(host: str, root: str) -> None:
+    """Warm host if its memory says so. Never raises: on failure the navigation just goes ahead."""
+    if not _should_warm(host):
+        return
+    async with _driver_lock:
+        # State may have changed while we waited for the lock (another client warmed it)
+        if not _should_warm(host):
+            return
+        if time.monotonic() - _last_warm.get(host, -1e9) < WARMUP_COOLDOWN:
+            return
+        try:
+            await _warmup_host(host, root)
+        except Exception:
+            log.exception("warm-up failed for %s", host)
+
+
+async def _warm_before_navigation(url: str) -> None:
+    """Called by the /cdp relay right before a client navigates to url."""
+    target = _warm_target(url)
+    if target:
+        await _warm_if_needed(*target)
+
+
+def _note_document_response(msg: str, navigated: set[str]) -> None:
+    """
+    Learn from a main-document response seen on the relay. A 403/429/503 for a host
+    this client navigated to means a direct visit failed (the cookie lapsed or the
+    site started challenging): remember it and renew the cookie in the background.
+    """
+    try:
+        resp = json.loads(msg)["params"]["response"]
+        status, target = int(resp["status"]), _warm_target(resp["url"])
+    except (ValueError, KeyError, TypeError):
+        return
+    if status not in (403, 429, 503) or not target:
+        return
+    host, root = target
+    # Our own warm-up in the server tab also shows up here: only count the client's navigations
+    if host not in navigated or host in _warming:
+        return
+    entry = _hosts.setdefault(host, {})
+    entry["needs_warmup"] = True
+    entry["fails"] = [*_recent_fails(entry), time.time()][-50:]  # capped: a page that always 403s must not grow forever
+    _save_hosts()
+    log.warning("warm-up: %s returned HTTP %s on a direct visit (%d failure(s) on record)",
+                host, status, len(entry["fails"]))
+    task = asyncio.create_task(_warm_if_needed(host, root))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1057,13 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                     return json.dumps(req)
                 return msg
 
+            held_navigations: set[asyncio.Task] = set()
+            navigated: set[str] = set()  # host keys this client navigated to (for failure learning)
+
+            async def send_after_warmup(url: str, msg: str) -> None:
+                await _warm_before_navigation(url)
+                await chrome_ws.send(msg)
+
             async def forward_in():
                 try:
                     while True:
@@ -890,6 +1072,21 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                             break
                         elif data["type"] == "websocket.receive":
                             msg = data.get("text") or data.get("bytes")
+                            if WARMUP and isinstance(msg, str) and '"Page.navigate"' in msg:
+                                try:
+                                    nav_url = json.loads(msg)["params"]["url"]
+                                except (ValueError, KeyError, TypeError):
+                                    nav_url = None
+                                target = _warm_target(nav_url) if nav_url else None
+                                if target:
+                                    navigated.add(target[0])
+                                if target and _should_warm(target[0]):
+                                    # Hold back only this navigation; keep relaying everything else, because
+                                    # Chrome pauses new targets until the client sends its resume message.
+                                    task = asyncio.create_task(send_after_warmup(nav_url, msg))
+                                    held_navigations.add(task)
+                                    task.add_done_callback(held_navigations.discard)
+                                    continue
                             if msg is not None and default_ctx and isinstance(msg, str):
                                 msg = await intercept(msg)
                             if msg is not None:
@@ -914,6 +1111,8 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                         if isinstance(msg, bytes):
                             await client_ws.send_bytes(msg)
                         else:
+                            if WARMUP and '"Network.responseReceived"' in msg and '"type":"Document"' in msg:
+                                _note_document_response(msg, navigated)
                             await client_ws.send_text(msg)
                 except Exception:
                     pass
@@ -922,9 +1121,9 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                 [asyncio.create_task(forward_in()), asyncio.create_task(forward_out())],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            for task in pending:
+            for task in [*pending, *held_navigations]:
                 task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*pending, *held_navigations, return_exceptions=True)
 
             # Client left without disposing its context: close its pages ourselves
             if opened_targets:

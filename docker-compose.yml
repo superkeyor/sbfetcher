@@ -36,11 +36,16 @@ services:
         environment:
             HOST: "0.0.0.0"           # must stay 0.0.0.0 for container-to-container traffic over the Docker bridge; host exposure is controlled by port: above
             PORT: "3000"              # port FastAPI listens on inside the container; must match :port above. need for healthcheck
-            WARMUP_TIMEOUT: "30"      # warm-up only: seconds to load a WARMUP_URLS page and get through Cloudflare (Playwright timeouts are set in changedetection)
-            # Cloudflare-protected sites to revisit so cf_clearance stays fresh in the shared profile.
-            # Comma-separated; the site root is enough (cf_clearance is per-domain).
-            WARMUP_URLS: "https://www.researchgate.net/"
-            WARMUP_INTERVAL: "60"     # minutes between warm-up rounds
+            # Master switch for the whole warm-up feature. true: a new host, or one whose last visit failed
+            # (403/429/503), has its site root visited first (bot check solved, cookies renewed); hosts that went
+            # through cleanly are fetched directly. The per-host memory is saved as sbfetcher-hosts.json in the
+            # profile volume below. false: no warm-up, no learning, no state file; /cdp is a plain relay to Chrome.
+            # The WARMUP_* settings below only apply while this is true.
+            WARMUP: "true"
+            WARMUP_TIMEOUT: "30"      # seconds to load the site root and get through the bot check (Playwright timeouts are set in changedetection)
+            WARMUP_COOLDOWN: "300"    # seconds; a needed warm-up is skipped if the host was warmed this recently (0 = no limit)
+            WARMUP_ALWAYS_AFTER: "2"  # this many failed direct visits ...
+            WARMUP_ALWAYS_DAYS: "90"  # ... within this many days = warm up before every check
             # Map Playwright's new_context() onto the persistent profile so checks reuse its cookies.
             CDP_SHARE_DEFAULT_CONTEXT: "true"
             # Leave unset to use Chrome's real UA (matches navigator.platform / client hints).

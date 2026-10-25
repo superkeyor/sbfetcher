@@ -30,11 +30,19 @@ ENV PYTHONUNBUFFERED=1
 # Server defaults — all overridable at runtime via docker run -e or compose
 ENV HOST=0.0.0.0
 ENV PORT=3000
-# Warm-up navigation + Cloudflare wait (seconds)
+# Master switch for the whole warm-up feature. true: a new host, or one whose last visit failed, has its
+# site root visited first (bot check solved, cookies renewed); hosts that went through cleanly are fetched
+# directly. false: no warm-up, no learning from failures, no state file; /cdp is a plain relay to Chrome.
+ENV WARMUP=true
+# Warm-up navigation + bot-check wait (seconds)
 ENV WARMUP_TIMEOUT=30
-# Comma-separated Cloudflare sites to revisit every WARMUP_INTERVAL minutes (empty = off)
-ENV WARMUP_URLS=""
-ENV WARMUP_INTERVAL=60
+# Skip a needed warm-up if the host was warmed less than this many seconds ago (0 = no limit)
+ENV WARMUP_COOLDOWN=300
+# A host with this many failed direct visits within WARMUP_ALWAYS_DAYS is warmed before every check
+ENV WARMUP_ALWAYS_AFTER=2
+ENV WARMUP_ALWAYS_DAYS=90
+# Per-host memory; default is sbfetcher-hosts.json inside CHROME_USER_DATA_DIR
+# ENV WARMUP_STATE_FILE=/app/chromiumprofile/sbfetcher-hosts.json
 # Map Playwright's new_context() onto the persistent profile
 ENV CDP_SHARE_DEFAULT_CONTEXT=true
 # Empty = Chrome's real user-agent

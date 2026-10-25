@@ -81,9 +81,12 @@ docker login
 |----------|---------|-------------|
 | `PORT` | `3000` | Listening port |
 | `HOST` | `0.0.0.0` | Bind address |
-| `WARMUP_URLS` | `` | Comma-separated Cloudflare sites revisited to keep `cf_clearance` fresh (empty = off) |
-| `WARMUP_INTERVAL` | `60` | Minutes between warm-up rounds |
-| `WARMUP_TIMEOUT` | `30` | Warm-up only: seconds to load a page and get through Cloudflare |
+| `WARMUP` | `true` | Master switch for the whole warm-up feature (see below). `false` = no warm-up, no learning, no state file; `/cdp` is a plain relay. The other `WARMUP_*` settings only apply while this is `true` |
+| `WARMUP_TIMEOUT` | `30` | Warm-up only: seconds to load the site root and get through the bot check |
+| `WARMUP_COOLDOWN` | `300` | A needed warm-up is skipped if the host was warmed this many seconds ago (`0` = no limit) |
+| `WARMUP_ALWAYS_AFTER` | `2` | This many failed direct visits within `WARMUP_ALWAYS_DAYS` ... |
+| `WARMUP_ALWAYS_DAYS` | `90` | ... makes a host "frequent": it is warmed before every check |
+| `WARMUP_STATE_FILE` | `<profile dir>/sbfetcher-hosts.json` | Per-host memory (empty = memory only) |
 | `CDP_SHARE_DEFAULT_CONTEXT` | `true` | Map Playwright's `new_context()` onto the persistent profile |
 | `USER_AGENT` | `` | Override Chrome's UA (empty = real UA; recommended) |
 | `WINDOW_WIDTH` | `1920` | Chrome window / Xvfb width |
@@ -98,12 +101,23 @@ Playwright timeouts are controlled by changedetection.io (e.g. its `CONNECTION_T
 
 ---
 
-## Cloudflare-protected sites
+## Bot-protected sites (Cloudflare, DataDome, ...)
 
+No configuration needed: sbfetcher learns per host whether it needs a warm-up.
+
+- **First check of a host:** the relay pauses the navigation, visits the site root in the server's own tab (solving any challenge and scrolling a little, like a person), then lets the check through. The fresh cookies land in the shared profile that changedetection's Playwright pages use. This adds a few seconds, up to `WARMUP_TIMEOUT` if the site is slow.
+- **Clean first response:** the next checks go **direct**, no warm-up.
+- **A direct check gets HTTP 403 / 429 / 503** (cookie expired or invalidated): that check is lost, since changedetection already received the error. sbfetcher remembers it and renews the cookie in the background, and the following checks go direct again.
+- **Frequent challengers:** a host with `WARMUP_ALWAYS_AFTER` such failures within `WARMUP_ALWAYS_DAYS` is warmed before every check. Old failures age out, after which it drifts back to direct.
+- **Never warmed:** non-http(s) URLs, `localhost`, private/LAN addresses, dotless names and `*.local`.
+- **Memory:** `sbfetcher-hosts.json` in the Chrome profile folder. Keep that folder on a volume; wiping it resets the memory together with the cookies.
+- **A page that always returns 403** (genuinely forbidden) costs one extra root visit per check.
+- **Stopping the container within ~30 s of a warm-up** can lose the fresh cookie, because Chrome writes cookies to disk lazily. That costs one failed check, which is then learned and repaired.
+
+Also:
 1. **Run from a residential IP.** Cloudflare hard-blocks many datacenter ranges with a 403 ("Sorry, you have been blocked") that no browser can get past.
-2. **Add the site to `WARMUP_URLS`** (e.g. `https://www.researchgate.net/`). The warm-up task solves the challenge in the server's own tab, and the `cf_clearance` cookie lands in the shared profile that changedetection's Playwright pages use.
-3. **Don't set a custom User-Agent on the watch.** `cf_clearance` is bound to the UA (and IP); a different UA throws it away.
-4. **Keep check intervals moderate** (ResearchGate: 6 h or more).
+2. **Don't set a custom User-Agent on the watch.** `cf_clearance` is bound to the UA (and IP); a different UA throws it away.
+3. **Keep check intervals moderate** (ResearchGate: 6 h or more).
 
 ---
 
