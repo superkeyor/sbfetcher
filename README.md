@@ -125,6 +125,7 @@ Also:
 
 - **Pure CDP Mode**: Chrome is launched and driven over the Chrome DevTools Protocol — no WebDriver, no chromedriver, no `--enable-automation`.
 - **`/cdp` relay**: forwards CDP messages between Playwright and Chrome. With `CDP_SHARE_DEFAULT_CONTEXT=true` it answers `Target.createBrowserContext` with Chrome's default context, so each check reuses the persistent profile instead of a fresh incognito context; pages the client opened are closed when it disposes the context or disconnects. Contexts requested with their own proxy are left alone.
+- **One window per page**: with the shared context, every page a client opens gets its own Chrome window. A tab hidden behind another tab renders no frames, which made `Page.screenshot` time out when the warm-up tab came to the front.
 - **One browser, many clients**: each `/cdp` client gets its own CDP connection to the same Chrome. With the shared context, concurrent clients see each other's pages (Playwright auto-attaches to every page in the context); use `FETCH_WORKERS=1` in changedetection.io if that causes trouble.
 - **Self-healing**: `/health` and new `/cdp` connections restart Chrome if it has died. Docker itself does not restart unhealthy containers.
 - **ARM64**: uses Playwright's Chromium build (Google does not ship ARM64 `.deb` packages). amd64 uses `google-chrome-stable` from Google's apt repo.

@@ -1052,6 +1052,10 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                 if params.get("browserContextId") == default_ctx:
                     if method == "Target.createTarget":
                         create_target_ids.add(req["id"])
+                        # Own window per client page: a hidden tab renders no frames, so screenshots hang.
+                        # Without this the page would share a window with our warm-up tab, which comes to
+                        # the front, and with other checks' pages.
+                        params["newWindow"] = True
                     # Chrome addresses the default context by omitting the id
                     del params["browserContextId"]
                     return json.dumps(req)
