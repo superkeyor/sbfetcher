@@ -24,7 +24,13 @@ services:
     sbfetcher:
         image: superkeyor/sbfetcher:latest
         container_name: sbfetcher
+        # Fixed hostname: Chrome's profile lock embeds it, so a recreated container
+        # (random hostname) would otherwise see the profile as "in use by another computer".
+        hostname: sbfetcher
         restart: unless-stopped
+        volumes:
+            # Persist the Chrome profile (datadome / cf_clearance cookies) across container recreation.
+            - /data/sbfetcher/chromiumprofile:/app/chromiumprofile
         ports:
             - "3000:3000"
         environment:
@@ -74,6 +80,7 @@ services:
     changedetection:
         image: ghcr.io/dgtlmoon/changedetection.io:latest
         container_name: changedetection
+        hostname: changedetection
         restart: unless-stopped
         volumes:
             - /data/changedetection:/datastore

@@ -42,17 +42,17 @@ from seleniumbase import cdp_driver
 # Config (env-overridable)
 # ---------------------------------------------------------------------------
 
-G_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO").upper()
 HOST           = os.getenv("HOST", "0.0.0.0")
 PORT           = int(os.getenv("PORT", "3000"))
 WARMUP_TIMEOUT = int(os.getenv("WARMUP_TIMEOUT", "30"))      # warm-up navigation + Cloudflare wait (seconds)
 WINDOW_W       = int(os.getenv("WINDOW_WIDTH", "1920"))
 WINDOW_H       = int(os.getenv("WINDOW_HEIGHT", "1080"))
 CHROME_ARGS    = os.getenv("EXTRA_CHROME_ARGS", "")        # space-separated extra flags
-# Empty        = Chrome's real UA, which matches navigator.platform and client hints.
+# Empty = Chrome's real UA, which matches navigator.platform and client hints.
 # cf_clearance is bound to the UA, so keep it stable once set.
 USER_AGENT     = os.getenv("USER_AGENT", "") or None
-# Set HEADED   = true to run Chrome in a virtual Xvfb display (less detectable than --headless)
+# Set HEADED=true to run Chrome in a virtual Xvfb display (less detectable than --headless)
 HEADED         = os.getenv("HEADED", "true").lower() in ("1", "true", "yes")
 # Persistent Chrome profile dir; matches CHROME_USER_DATA_DIR in Dockerfile
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile") or None
