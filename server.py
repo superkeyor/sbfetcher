@@ -30,6 +30,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import tempfile
 import time
 import urllib.request
@@ -72,6 +73,9 @@ WARMUP_COOLDOWN = float(os.getenv("WARMUP_COOLDOWN", "300"))
 # A host that failed this many direct visits within WARMUP_ALWAYS_DAYS is warmed before every check.
 WARMUP_ALWAYS_AFTER = int(os.getenv("WARMUP_ALWAYS_AFTER", "2"))
 WARMUP_ALWAYS_DAYS  = float(os.getenv("WARMUP_ALWAYS_DAYS", "90"))
+# Trim the Chrome profile's cache folders at startup when the profile is bigger than this many MB.
+# Empty or 0 = never trim (the default). Cookies, site storage and the warm-up memory are never deleted.
+PROFILE_MAX_MB = float(os.getenv("PROFILE_MAX_MB") or 0)
 # Per-host memory; default sits in the (persistent) Chrome profile folder. Empty path = in-memory only.
 WARMUP_STATE_FILE = os.getenv("WARMUP_STATE_FILE") or (
     os.path.join(os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile"), "sbfetcher-hosts.json")
@@ -124,6 +128,53 @@ def _fetch_ws_url() -> str:
         return json.loads(r.read())["webSocketDebuggerUrl"]
 
 
+# Re-creatable cache folders inside the profile (relative paths). Deliberately not listed: Cookies,
+# Local Storage, IndexedDB, Service Worker/Database, Preferences, sbfetcher-hosts.json.
+_PROFILE_CACHE_DIRS = (
+    "Default/Cache", "Default/Code Cache", "Default/GPUCache", "Default/DawnWebGPUCache",
+    "Default/DawnGraphiteCache", "Default/Media Cache", "Default/Service Worker/CacheStorage",
+    "Default/Service Worker/ScriptCache", "GPUCache", "ShaderCache", "GrShaderCache", "component_crx_cache",
+)
+
+
+def _dir_mb(path: str) -> float:
+    """Disk usage of a directory tree in MB (counts allocated blocks, like du)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total / 1048576
+
+
+def _trim_profile() -> None:
+    """
+    If the profile exceeds PROFILE_MAX_MB, delete its cache folders (Chrome re-creates them).
+    Must run while Chrome is not running. Never raises.
+    """
+    if PROFILE_MAX_MB <= 0 or not CHROME_USER_DATA_DIR or not os.path.isdir(CHROME_USER_DATA_DIR):
+        return
+    try:
+        before = _dir_mb(CHROME_USER_DATA_DIR)
+        if before <= PROFILE_MAX_MB:
+            log.info("profile: %.0f MB (limit %.0f MB), no trim needed", before, PROFILE_MAX_MB)
+            return
+        for rel in _PROFILE_CACHE_DIRS:
+            path = os.path.join(CHROME_USER_DATA_DIR, rel)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+        after = _dir_mb(CHROME_USER_DATA_DIR)
+        log.info("profile: trimmed caches, %.0f MB -> %.0f MB (limit %.0f MB)", before, after, PROFILE_MAX_MB)
+        if after > PROFILE_MAX_MB:
+            log.warning(
+                "profile: still above the limit; the rest is site data (cookies, storage), which is never deleted"
+            )
+    except Exception:
+        log.exception("profile: trim failed (non-fatal)")
+
+
 async def _build_cdp_browser() -> tuple[Any, Any]:
     """
     Launch a new Pure CDP Mode browser and return (driver, tab).
@@ -141,7 +192,7 @@ async def _build_cdp_browser() -> tuple[Any, Any]:
         # browser_executable_path can be set if Chrome is not on PATH;
         # the Dockerfile symlinks chromium-browser onto PATH.
         user_data_dir=CHROME_USER_DATA_DIR,
-        extra_chromium_args=extra,
+        browser_args=extra,  # the launcher ignores unknown keyword arguments, so the name matters
     )
     tab = await driver.get("about:blank")
     await tab.set_window_size(0, 0, WINDOW_W, WINDOW_H)
@@ -206,6 +257,8 @@ async def lifespan(app: FastAPI):
         os.environ["DISPLAY"] = ":99"
         await asyncio.sleep(0.5)  # give Xvfb time to initialise
         log.info("Xvfb started on :99 (%dx%d, headed mode)", WINDOW_W, WINDOW_H)
+    # Startup: shrink the profile's caches if it grew past PROFILE_MAX_MB (Chrome must not be running yet)
+    await asyncio.to_thread(_trim_profile)
     # Startup: warm up the CDP browser
     log.info("Starting Pure CDP Mode browser (headless=%s)...", not HEADED)
     async with _driver_lock:

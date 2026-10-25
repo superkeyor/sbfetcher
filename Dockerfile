@@ -51,6 +51,10 @@ ENV WINDOW_WIDTH=1920
 ENV WINDOW_HEIGHT=1080
 ENV LOG_LEVEL=INFO
 ENV HEADED=true
+# Optional size limit for the Chrome profile, in MB. Unset or 0 = never trim (default). If the profile is
+# bigger at container start, its cache folders are deleted (cached pages, images; Chrome re-creates them);
+# cookies, site storage, extensions and the warm-up memory are kept. Example: PROFILE_MAX_MB=2000
+# ENV PROFILE_MAX_MB=0
 # Persistent Chrome profile directory.
 # Default points to the chromiumprofile/ folder baked into the image.
 # Override at runtime to use a host-mounted volume instead.

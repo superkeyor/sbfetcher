@@ -46,6 +46,10 @@ services:
             WARMUP_COOLDOWN: "300"    # seconds; a needed warm-up is skipped if the host was warmed this recently (0 = no limit)
             WARMUP_ALWAYS_AFTER: "2"  # this many failed direct visits ...
             WARMUP_ALWAYS_DAYS: "90"  # ... within this many days = warm up before every check
+            # Optional size limit for the Chrome profile (MB). Leave unset (or 0) to never trim. If the profile is
+            # bigger when the container starts, its cache folders are deleted (cached pages, images; Chrome re-creates
+            # them); cookies, site storage, extensions and the warm-up memory are kept.
+            # PROFILE_MAX_MB: "2000"
             # Map Playwright's new_context() onto the persistent profile so checks reuse its cookies.
             CDP_SHARE_DEFAULT_CONTEXT: "true"
             # Leave unset to use Chrome's real UA (matches navigator.platform / client hints).

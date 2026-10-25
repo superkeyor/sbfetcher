@@ -89,10 +89,11 @@ docker login
 | `WARMUP_STATE_FILE` | `<profile dir>/sbfetcher-hosts.json` | Per-host memory (empty = memory only) |
 | `CDP_SHARE_DEFAULT_CONTEXT` | `true` | Map Playwright's `new_context()` onto the persistent profile |
 | `USER_AGENT` | `` | Override Chrome's UA (empty = real UA; recommended) |
+| `PROFILE_MAX_MB` | unset (= off) | Optional size limit for the Chrome profile. If it is bigger when the container starts, the cache folders are deleted (cached pages, images); cookies, site storage, extensions and the warm-up memory are kept. Leave unset or `0` to never trim |
 | `WINDOW_WIDTH` | `1920` | Chrome window / Xvfb width |
 | `WINDOW_HEIGHT` | `1080` | Chrome window / Xvfb height |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
-| `EXTRA_CHROME_ARGS` | `` | Space-separated extra Chrome flags |
+| `EXTRA_CHROME_ARGS` | `` | Space-separated extra Chrome flags, e.g. `--load-extension=/ext` (mount the unpacked extension folder at `/ext`) |
 | `HEADED` | `true` | Run Chrome in a virtual Xvfb display instead of `--headless` |
 | `CHROME_USER_DATA_DIR` | `/app/chromiumprofile` | Chrome profile dir; defaults to the folder baked into the image |
 | `DEBUG_SNAPSHOT` | `false` | Save HTML + PNG of every warm-up visit to `DEBUG_SNAPSHOT_DIR` |
@@ -125,6 +126,7 @@ Also:
 
 - **Pure CDP Mode**: Chrome is launched and driven over the Chrome DevTools Protocol — no WebDriver, no chromedriver, no `--enable-automation`.
 - **`/cdp` relay**: forwards CDP messages between Playwright and Chrome. With `CDP_SHARE_DEFAULT_CONTEXT=true` it answers `Target.createBrowserContext` with Chrome's default context, so each check reuses the persistent profile instead of a fresh incognito context; pages the client opened are closed when it disposes the context or disconnects. Contexts requested with their own proxy are left alone.
+- **Profile size**: the profile grows with every site changedetection visits (cache, cookies, site storage). Check it with `du -sh` on the profile volume. `PROFILE_MAX_MB` trims the caches at container start when you set it; it never touches cookies, site storage or extensions, so if the profile is still over the limit after a trim, the log says so.
 - **One window per page**: with the shared context, every page a client opens gets its own Chrome window. A tab hidden behind another tab renders no frames, which made `Page.screenshot` time out when the warm-up tab came to the front.
 - **One browser, many clients**: each `/cdp` client gets its own CDP connection to the same Chrome. With the shared context, concurrent clients see each other's pages (Playwright auto-attaches to every page in the context); use `FETCH_WORKERS=1` in changedetection.io if that causes trouble.
 - **Self-healing**: `/health` and new `/cdp` connections restart Chrome if it has died. Docker itself does not restart unhealthy containers.
