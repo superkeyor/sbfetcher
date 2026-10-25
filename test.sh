@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Manual curl commands for sbfetcher API.
+# Manual commands for the sbfetcher API.
 # Paste any block directly into a terminal to see raw output.
 # Override the base URL:  BASE_URL=http://my-host:3000
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
-URL="https://bot.sannysoft.com"   # "https://nowsecure.nl/#relax"
+WS_URL="${BASE_URL/http/ws}"
 
 # ---------------------------------------------------------------------------
 # GET /health
@@ -12,57 +12,40 @@ URL="https://bot.sannysoft.com"   # "https://nowsecure.nl/#relax"
 curl -s "$BASE_URL/health" | jq .
 
 # ---------------------------------------------------------------------------
-# GET /metrics
+# WS /cdp — Browser.getVersion through the relay
 # ---------------------------------------------------------------------------
-curl -s "$BASE_URL/metrics" | jq .
+python3 - "$WS_URL/cdp" <<'EOF'
+import asyncio, json, sys
+import websockets
+
+async def main(url):
+    async with websockets.connect(url) as ws:
+        await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+        print(json.dumps(json.loads(await ws.recv()), indent=2))
+
+asyncio.run(main(sys.argv[1]))
+EOF
 
 # ---------------------------------------------------------------------------
-# POST /content
+# WS /cdp — fetch a page the way changedetection.io does (needs: pip install playwright)
 # ---------------------------------------------------------------------------
-curl -s -X POST "$BASE_URL/content" \
-  -H "Content-Type: application/json" \
-  -d "{\"url\": \"$URL\"}" | jq '{url, length: (.data | length)}'
+python3 - "$WS_URL/cdp" "https://www.researchgate.net/profile/John-Mace-2" <<'EOF'
+import asyncio, sys
+from playwright.async_api import async_playwright
 
-# with extra options
-curl -s -X POST "$BASE_URL/content" \
-  -H "Content-Type: application/json" \
-  -d "{\"url\": \"$URL\", \"waitForTimeout\": 1000, \"javascript\": \"document.title\"}" | jq '{url, length: (.data | length)}'
+async def main(cdp_url, url):
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(cdp_url)
+        context = await browser.new_context()
+        page = await context.new_page()
+        resp = await page.goto(url, wait_until="domcontentloaded")
+        print("status:", resp.status if resp else None)
+        print("title: ", await page.title())
+        print("ua:    ", await page.evaluate("navigator.userAgent"))
+        print("platform:", await page.evaluate("[navigator.platform, navigator.userAgentData && navigator.userAgentData.platform]"))
+        print("cf_clearance:", any(c["name"] == "cf_clearance" for c in await context.cookies()))
+        await context.close()
+        await browser.close()
 
-# ---------------------------------------------------------------------------
-# POST /screenshot  (save to ./snapshot.png)
-# ---------------------------------------------------------------------------
-curl -s -X POST "$BASE_URL/screenshot" \
-  -H "Content-Type: application/json" \
-  -d "{\"url\": \"$URL\"}" \
-  -o ./snapshot.png && echo "Saved ./snapshot.png ($(wc -c < ./snapshot.png) bytes)"
-
-# ---------------------------------------------------------------------------
-# POST /v1 — sessions.create
-# ---------------------------------------------------------------------------
-curl -s -X POST "$BASE_URL/v1" \
-  -H "Content-Type: application/json" \
-  -d '{"cmd": "sessions.create"}' | jq .
-
-# POST /v1 — sessions.list
-curl -s -X POST "$BASE_URL/v1" \
-  -H "Content-Type: application/json" \
-  -d '{"cmd": "sessions.list"}' | jq .
-
-# POST /v1 — sessions.destroy  (replace SESSION_ID)
-curl -s -X POST "$BASE_URL/v1" \
-  -H "Content-Type: application/json" \
-  -d '{"cmd": "sessions.destroy", "session": "SESSION_ID"}' | jq .
-
-# ---------------------------------------------------------------------------
-# POST /v1 — request.get
-# ---------------------------------------------------------------------------
-curl -s -X POST "$BASE_URL/v1" \
-  -H "Content-Type: application/json" \
-  -d "{\"cmd\": \"request.get\", \"url\": \"$URL\", \"maxTimeout\": 30000}" \
-  | jq '{status, message, version, url: .solution.url, cookies: (.solution.cookies | length), ua: .solution.userAgent}'
-
-# with screenshot (base64 PNG in .solution.screenshot)
-curl -s -X POST "$BASE_URL/v1" \
-  -H "Content-Type: application/json" \
-  -d "{\"cmd\": \"request.get\", \"url\": \"$URL\", \"screenshot\": true, \"maxTimeout\": 30000}" \
-  | jq '{status, has_screenshot: (.solution.screenshot != null)}'
+asyncio.run(main(sys.argv[1], sys.argv[2]))
+EOF

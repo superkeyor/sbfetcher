@@ -1,8 +1,8 @@
 # sbfetcher
 
-A **headless Chrome REST API** backed by
+A **headed Chrome behind a CDP WebSocket relay**, backed by
 [SeleniumBase](https://seleniumbase.io/) Pure CDP Mode + [FastAPI](https://fastapi.tiangolo.com/),
-designed as a drop-in fetcher for [changedetection.io](https://github.com/dgtlmoon/changedetection.io).
+designed as a stealthy Playwright browser for [changedetection.io](https://github.com/dgtlmoon/changedetection.io).
 
 Supports **linux/amd64** and **linux/arm64** (OCI/Oracle Cloud, Raspberry Pi, M-series Mac via Rosetta).
 
@@ -12,44 +12,9 @@ Supports **linux/amd64** and **linux/arm64** (OCI/Oracle Cloud, Raspberry Pi, M-
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/content` | Render URL → return full HTML |
-| `POST` | `/chromium/content` | Alias (browserless v1) |
-| `POST` | `/screenshot` | Render URL → return PNG/JPEG |
-| `POST` | `/chromium/screenshot` | Alias (browserless v1) |
-| `POST` | `/v1` | FlareSolverr-compatible endpoint |
-| `WS`   | `/cdp` | Chrome CDP proxy (for `PLAYWRIGHT_DRIVER_URL`) |
-| `GET`  | `/health` | Liveness probe |
-| `GET`  | `/metrics` | Request/error counters |
+| `WS`   | `/cdp` | Chrome CDP relay (for `PLAYWRIGHT_DRIVER_URL`) |
+| `GET`  | `/health` | Liveness probe — `503` (and a restart attempt) when Chrome is down |
 | `GET`  | `/docs` | Swagger UI |
-
-### Request body (both `/content` and `/screenshot`)
-
-```json
-{
-  "url": "https://example.com",
-  "gotoOptions": {
-    "waitUntil": "domcontentloaded",
-    "timeout": 30000
-  },
-  "waitForSelector": "#content",
-  "waitForTimeout": 2000,
-  "userAgent": "Mozilla/5.0 ...",
-  "cookies": [{ "name": "session", "value": "abc", "domain": ".example.com" }],
-  "headers": { "Accept-Language": "en-US" },
-  "javascript": "window.scrollTo(0, document.body.scrollHeight)",
-  "viewport": { "width": 1920, "height": 1080 }
-}
-```
-
-Screenshot-only extras:
-
-```json
-{
-  "fullPage": true,
-  "type": "png",
-  "quality": 85
-}
-```
 
 ---
 
@@ -62,19 +27,16 @@ docker compose up -d
 ```
 
 - changedetection.io UI: http://localhost:5000
-- Fetcher API:           http://localhost:3000
+- Fetcher:               http://localhost:3000
 - Swagger docs:          http://localhost:3000/docs
 
 ### changedetection.io integration
 
-Both fetch methods work simultaneously — choose per watch in the cd.io UI:
+| cd.io setting | Value |
+|--------------|-------|
+| `PLAYWRIGHT_DRIVER_URL` env var | `ws://sbfetcher:3000/cdp` |
 
-| Method | cd.io setting | Value |
-|--------|--------------|-------|
-| **Playwright** (stealthy Chrome CDP) | `PLAYWRIGHT_DRIVER_URL` env var | `ws://sbfetcher:3000/cdp` |
-| **FlareSolverr** (bypass bot detection) | `FLARESOLVERR_URL` env var | `http://sbfetcher:3000` |
-
-Both are pre-configured in the included `docker-compose.yml`.
+Pre-configured in the included `docker-compose.yml`. Select **Playwright Chromium/Javascript** as the fetch method per watch.
 
 ### Standalone
 
@@ -119,48 +81,37 @@ docker login
 |----------|---------|-------------|
 | `PORT` | `3000` | Listening port |
 | `HOST` | `0.0.0.0` | Bind address |
-| `PAGE_TIMEOUT` | `30` | Navigation timeout (seconds) |
-| `WAIT_AFTER_LOAD` | `1` | Extra settle time after load (seconds) |
-| `WINDOW_WIDTH` | `1280` | Chrome viewport width |
-| `WINDOW_HEIGHT` | `900` | Chrome viewport height |
+| `WARMUP_URLS` | `` | Comma-separated Cloudflare sites revisited to keep `cf_clearance` fresh (empty = off) |
+| `WARMUP_INTERVAL` | `60` | Minutes between warm-up rounds |
+| `WARMUP_TIMEOUT` | `30` | Warm-up only: seconds to load a page and get through Cloudflare |
+| `CDP_SHARE_DEFAULT_CONTEXT` | `true` | Map Playwright's `new_context()` onto the persistent profile |
+| `USER_AGENT` | `` | Override Chrome's UA (empty = real UA; recommended) |
+| `WINDOW_WIDTH` | `1920` | Chrome window / Xvfb width |
+| `WINDOW_HEIGHT` | `1080` | Chrome window / Xvfb height |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 | `EXTRA_CHROME_ARGS` | `` | Space-separated extra Chrome flags |
-| `HEADED` | `false` | Run Chrome in a virtual Xvfb display (`true` for debugging) |
+| `HEADED` | `true` | Run Chrome in a virtual Xvfb display instead of `--headless` |
 | `CHROME_USER_DATA_DIR` | `/app/chromiumprofile` | Chrome profile dir; defaults to the folder baked into the image |
+| `DEBUG_SNAPSHOT` | `false` | Save HTML + PNG of every warm-up visit to `DEBUG_SNAPSHOT_DIR` |
+
+Playwright timeouts are controlled by changedetection.io (e.g. its `CONNECTION_TIMEOUT` env var), not by sbfetcher.
 
 ---
 
-## Timeout configuration
+## Cloudflare-protected sites
 
-`PAGE_TIMEOUT` (env var, default `30` s) is the global navigation timeout. Per-request fields override it with no upper cap.
-
-| Integration | Where to set | Field / mechanism |
-|-------------|-------------|-------------------|
-| **FlareSolverr** `/v1` | cd.io UI → watch → **Requests** tab → *Request timeout* | `maxTimeout` (ms) sent automatically by cd.io |
-| **Playwright** `/cdp` | cd.io env var `CONNECTION_TIMEOUT` (ms) | Playwright `connect_over_cdp(timeout=…)` — handled client-side |
-| **`/content` / `/screenshot`** direct API | request body | `gotoOptions.timeout` (ms) — navigation; `waitForTimeout` (ms) — extra settle |
-
-### changedetection.io example
-
-For a slow page using the FlareSolverr fetcher, set **Request timeout = 120 s** in the watch's Requests tab. cd.io will send `maxTimeout: 120000` and sbfetcher will honour it.
-
-For the Playwright fetcher, set `CONNECTION_TIMEOUT=120000` on the changedetection service:
-
-```yaml
-changedetection:
-  environment:
-    CONNECTION_TIMEOUT: "120000"
-    PLAYWRIGHT_DRIVER_URL: "ws://sbfetcher:3000/cdp"
-```
+1. **Run from a residential IP.** Cloudflare hard-blocks many datacenter ranges with a 403 ("Sorry, you have been blocked") that no browser can get past.
+2. **Add the site to `WARMUP_URLS`** (e.g. `https://www.researchgate.net/`). The warm-up task solves the challenge in the server's own tab, and the `cf_clearance` cookie lands in the shared profile that changedetection's Playwright pages use.
+3. **Don't set a custom User-Agent on the watch.** `cf_clearance` is bound to the UA (and IP); a different UA throws it away.
+4. **Keep check intervals moderate** (ResearchGate: 6 h or more).
 
 ---
 
 ## Notes
 
-- **Pure CDP Mode**: Chrome is driven directly via the Chrome DevTools Protocol — no WebDriver, no chromedriver. This makes detection extremely difficult.
-- **`/cdp` WebSocket proxy**: exposes Chrome’s internal CDP endpoint at a fixed address. changedetection.io’s `connect_over_cdp()` connects through it. The proxy transparently forwards all CDP messages and automatically reconnects on Chrome restart.
-- **FlareSolverr `/v1`**: implements the FlareSolverr v1 API contract (`request.get`, `sessions.*`). Set `FLARESOLVERR_URL=http://sbfetcher:3000` in changedetection.io.
-- **`HEADED=true`**: starts an Xvfb virtual framebuffer (`:99`) and runs Chrome non-headlessly inside it — useful for debugging bot-detection issues without a real display.
-- **ARM64**: uses `chromium` from apt (Google does not ship ARM64 `.deb` packages). amd64 uses `google-chrome-stable` from Google’s apt repo.
-- The CDP driver is serialized for the `/content`, `/screenshot`, and `/v1` endpoints (one request at a time). The `/cdp` WebSocket proxy is independent and does not go through the lock. Scale horizontally with multiple containers + a load balancer if throughput matters.
-- `SYS_ADMIN` capability is required for Chrome’s namespace sandbox inside Docker. If your host policy forbids it, add `--no-sandbox` via `EXTRA_CHROME_ARGS`.
+- **Pure CDP Mode**: Chrome is launched and driven over the Chrome DevTools Protocol — no WebDriver, no chromedriver, no `--enable-automation`.
+- **`/cdp` relay**: forwards CDP messages between Playwright and Chrome. With `CDP_SHARE_DEFAULT_CONTEXT=true` it answers `Target.createBrowserContext` with Chrome's default context, so each check reuses the persistent profile instead of a fresh incognito context; pages the client opened are closed when it disposes the context or disconnects. Contexts requested with their own proxy are left alone.
+- **One browser, many clients**: each `/cdp` client gets its own CDP connection to the same Chrome. With the shared context, concurrent clients see each other's pages (Playwright auto-attaches to every page in the context); use `FETCH_WORKERS=1` in changedetection.io if that causes trouble.
+- **Self-healing**: `/health` and new `/cdp` connections restart Chrome if it has died. Docker itself does not restart unhealthy containers.
+- **ARM64**: uses Playwright's Chromium build (Google does not ship ARM64 `.deb` packages). amd64 uses `google-chrome-stable` from Google's apt repo.
+- `SYS_ADMIN` capability is required for Chrome's namespace sandbox inside Docker. If your host policy forbids it, add `--no-sandbox` via `EXTRA_CHROME_ARGS`.

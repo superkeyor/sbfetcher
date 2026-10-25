@@ -7,7 +7,7 @@ set -euo pipefail
 echo "==> SeleniumBase Pure CDP Fetcher"
 echo "    Host:    ${HOST:-0.0.0.0}"
 echo "    Port:    ${PORT:-3000}"
-echo "    Timeout: ${PAGE_TIMEOUT:-30}s"
+echo "    Warm-up timeout: ${WARMUP_TIMEOUT:-30}s"
 echo "    Log:     ${LOG_LEVEL:-INFO}"
 
 # Verify Chrome is available before starting the server

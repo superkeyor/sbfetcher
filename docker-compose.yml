@@ -6,27 +6,18 @@
 #
 # changedetection.io UI: http://localhost:5000
 #   (override to :5555 via docker-compose.override.yml for local dev on Mac, because 5000 used by airplay)
-# Fetcher API:           http://localhost:3000
-#   POST /content        -> rendered HTML
-#   POST /screenshot     -> PNG image
-#   WS   /cdp            -> Chrome CDP proxy (for PLAYWRIGHT_DRIVER_URL)
-#   POST /v1             -> FlareSolverr-compatible endpoint (for direct API use)
+# Fetcher:               http://localhost:3000
+#   WS   /cdp            -> Chrome CDP relay (for PLAYWRIGHT_DRIVER_URL)
 #   GET  /health
-#   GET  /metrics
 #
 # changedetection.io integration:
 #   Playwright fetch:   PLAYWRIGHT_DRIVER_URL=ws://sbfetcher:3000/cdp
 #                       (already set below; select "Playwright Chromium/Javascript" per watch)
-#   FlareSolverr:       NOT supported by changedetection.io in any form.
-#                       FLARESOLVERR_URL env var is silently ignored.
-#                       Using /v1 as an HTTP proxy also fails (ERR_TUNNEL_CONNECTION_FAILED)
-#                       because FlareSolverr is an API, not an HTTP CONNECT proxy.
-#                       See: https://github.com/dgtlmoon/changedetection.io/discussions/2445
 # ============================================================================
 
 services:
-    # NOTE: sbfetcher must be listed first — service definition order
-    # determines file-descriptor numbering for dup() in start.sh.
+    # NOTE: sbfetcher must be listed first — dup() in the host's ~/.bashrc
+    # rebuilds the image named by the first service.
     # --------------------------------------------------------------------------
     # SeleniumBase + FastAPI headless Chrome fetcher
     # --------------------------------------------------------------------------
@@ -35,13 +26,19 @@ services:
         container_name: sbfetcher
         restart: unless-stopped
         ports:
-            - "3000:3000"   # primary port
-            - "8191:3000"   # FlareSolverr conventional port alias (both point to same server)
+            - "3000:3000"
         environment:
             HOST: "0.0.0.0"           # must stay 0.0.0.0 for container-to-container traffic over the Docker bridge; host exposure is controlled by port: above
             PORT: "3000"              # port FastAPI listens on inside the container; must match :port above. need for healthcheck
-            PAGE_TIMEOUT: "30"        # seconds Playwright waits for a page to fully load before giving up
-            WAIT_AFTER_LOAD: "5"      # wait seconds for WAFs to settle before returning content
+            WARMUP_TIMEOUT: "30"      # warm-up only: seconds to load a WARMUP_URLS page and get through Cloudflare (Playwright timeouts are set in changedetection)
+            # Cloudflare-protected sites to revisit so cf_clearance stays fresh in the shared profile.
+            # Comma-separated; the site root is enough (cf_clearance is per-domain).
+            WARMUP_URLS: "https://www.researchgate.net/"
+            WARMUP_INTERVAL: "60"     # minutes between warm-up rounds
+            # Map Playwright's new_context() onto the persistent profile so checks reuse its cookies.
+            CDP_SHARE_DEFAULT_CONTEXT: "true"
+            # Leave unset to use Chrome's real UA (matches navigator.platform / client hints).
+            # USER_AGENT: ""
             WINDOW_WIDTH: "1920"      # Xvfb virtual display width; realistic size reduces bot-detection risk
             WINDOW_HEIGHT: "1080"     # Xvfb virtual display height
             LOG_LEVEL: "INFO"
@@ -50,7 +47,7 @@ services:
             HEADED: "true"
             # Optional: pass extra Chrome flags (space-separated)
             # EXTRA_CHROME_ARGS: "--proxy-server=http://proxy:8080"
-            # Debug snapshots: set to "true" to save HTML+PNG to DEBUG_SNAPSHOT_DIR after every request.
+            # Debug snapshots: set to "true" to save HTML+PNG to DEBUG_SNAPSHOT_DIR after every warm-up visit.
             # WARNING: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which is on the tmpfs below
             # (RAM-only, wiped on restart). Override to a volume path to persist across restarts.
             DEBUG_SNAPSHOT: "false"

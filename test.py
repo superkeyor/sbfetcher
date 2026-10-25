@@ -18,7 +18,7 @@ Run against a remote host:
 """
 
 import asyncio
-import base64
+import json
 import os
 
 import pytest
@@ -26,9 +26,6 @@ import requests
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:3000").rstrip("/")
 WS_URL = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
-
-# A lightweight public page used for browser tests (small, reliable)
-TEST_URL = "https://example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +38,31 @@ def get(path: str, **kwargs) -> requests.Response:
 
 def post(path: str, **kwargs) -> requests.Response:
     return requests.post(f"{BASE_URL}{path}", timeout=60, **kwargs)
+
+
+async def cdp_call(ws, msg_id: int, method: str, params: dict | None = None) -> dict:
+    """Send one CDP command and return its reply, skipping events."""
+    await ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+    while True:
+        reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        if reply.get("id") == msg_id:
+            return reply
+
+
+def run_cdp(fn):
+    """Open a /cdp WebSocket, run fn(ws), and return its result."""
+    websockets = pytest.importorskip("websockets")
+
+    async def _run():
+        async with websockets.connect(
+            f"{WS_URL}/cdp",
+            open_timeout=10,
+            close_timeout=5,
+            max_size=2**28,
+        ) as ws:
+            return await fn(ws)
+
+    return asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -57,265 +79,21 @@ class TestHealth:
         assert data["status"] == "ok"
         assert data["mode"] == "pure-cdp"
         assert isinstance(data["uptime_seconds"], (int, float))
-        assert isinstance(data["browser_active"], bool)
+        assert data["browser_active"] is True
 
 
 # ---------------------------------------------------------------------------
-# GET /metrics
+# Removed REST endpoints
 # ---------------------------------------------------------------------------
 
-class TestMetrics:
-    def test_status_ok(self):
-        r = get("/metrics")
-        assert r.status_code == 200
+class TestRemovedEndpoints:
+    @pytest.mark.parametrize("path", ["/content", "/screenshot", "/chromium/content", "/v1"])
+    def test_post_returns_404(self, path):
+        r = post(path, json={"url": "https://example.com"})
+        assert r.status_code == 404
 
-    def test_response_fields(self):
-        data = get("/metrics").json()
-        assert isinstance(data["requests_total"], int)
-        assert isinstance(data["errors_total"], int)
-        assert isinstance(data["uptime_seconds"], (int, float))
-        assert isinstance(data["error_rate"], float)
-
-    def test_requests_increment(self):
-        before = get("/metrics").json()["requests_total"]
-        # /health counts as a request too, so just verify the counter is non-negative
-        assert before >= 0
-
-
-# ---------------------------------------------------------------------------
-# POST /content
-# ---------------------------------------------------------------------------
-
-@pytest.mark.browser
-class TestContent:
-    def test_basic_fetch(self):
-        r = post("/content", json={"url": TEST_URL})
-        assert r.status_code == 200
-        data = r.json()
-        assert "data" in data
-        assert "url" in data
-        assert "<html" in data["data"].lower()
-
-    def test_returns_final_url(self):
-        data = post("/content", json={"url": TEST_URL}).json()
-        assert data["url"].startswith("http")
-
-    def test_with_wait_timeout(self):
-        r = post("/content", json={"url": TEST_URL, "waitForTimeout": 500})
-        assert r.status_code == 200
-        assert "<html" in r.json()["data"].lower()
-
-    def test_with_goto_options(self):
-        r = post("/content", json={
-            "url": TEST_URL,
-            "gotoOptions": {"waitUntil": "domcontentloaded", "timeout": 30000},
-        })
-        assert r.status_code == 200
-
-    def test_with_viewport(self):
-        r = post("/content", json={
-            "url": TEST_URL,
-            "viewport": {"width": 1920, "height": 1080},
-        })
-        assert r.status_code == 200
-
-    def test_with_custom_user_agent(self):
-        r = post("/content", json={
-            "url": TEST_URL,
-            "userAgent": "Mozilla/5.0 (Test Bot)",
-        })
-        assert r.status_code == 200
-
-    def test_with_javascript(self):
-        r = post("/content", json={
-            "url": TEST_URL,
-            "javascript": "document.title = 'overridden'",
-        })
-        assert r.status_code == 200
-
-    def test_missing_url_returns_422(self):
-        r = post("/content", json={})
-        assert r.status_code == 422
-
-
-# ---------------------------------------------------------------------------
-# POST /chromium/content  (browserless v1 alias)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.browser
-class TestChromiumContent:
-    def test_alias_returns_same_shape(self):
-        r = post("/chromium/content", json={"url": TEST_URL})
-        assert r.status_code == 200
-        data = r.json()
-        assert "data" in data
-        assert "url" in data
-        assert "<html" in data["data"].lower()
-
-
-# ---------------------------------------------------------------------------
-# POST /screenshot
-# ---------------------------------------------------------------------------
-
-@pytest.mark.browser
-class TestScreenshot:
-    def test_returns_png_by_default(self):
-        r = post("/screenshot", json={"url": TEST_URL})
-        assert r.status_code == 200
-        assert r.headers["content-type"] == "image/png"
-        # PNG magic bytes
-        assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
-
-    def test_jpeg_type(self):
-        r = post("/screenshot", json={
-            "url": TEST_URL,
-            "type": "jpeg",
-            "quality": 80,
-        })
-        assert r.status_code == 200
-        # Server returns jpeg if Pillow is available, otherwise falls back to png
-        assert r.headers["content-type"] in ("image/jpeg", "image/png")
-
-    def test_full_page_false(self):
-        r = post("/screenshot", json={"url": TEST_URL, "fullPage": False})
-        assert r.status_code == 200
-        assert r.headers["content-type"] == "image/png"
-
-    def test_missing_url_returns_422(self):
-        r = post("/screenshot", json={})
-        assert r.status_code == 422
-
-
-# ---------------------------------------------------------------------------
-# POST /chromium/screenshot  (browserless v1 alias)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.browser
-class TestChromiumScreenshot:
-    def test_alias_returns_image(self):
-        r = post("/chromium/screenshot", json={"url": TEST_URL})
-        assert r.status_code == 200
-        assert r.headers["content-type"].startswith("image/")
-
-
-# ---------------------------------------------------------------------------
-# POST /v1  (FlareSolverr-compatible)
-# ---------------------------------------------------------------------------
-
-class TestFlareSolverrSessions:
-    def test_sessions_create_returns_ok(self):
-        r = post("/v1", json={"cmd": "sessions.create"})
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok"
-        assert "session" in data
-        assert isinstance(data["session"], str)
-        assert len(data["session"]) > 0
-
-    def test_sessions_create_includes_version(self):
-        data = post("/v1", json={"cmd": "sessions.create"}).json()
-        assert "version" in data
-        assert "startTimestamp" in data
-        assert "endTimestamp" in data
-
-    def test_sessions_list_includes_created_session(self):
-        session_id = post("/v1", json={"cmd": "sessions.create"}).json()["session"]
-        data = post("/v1", json={"cmd": "sessions.list"}).json()
-        assert data["status"] == "ok"
-        assert session_id in data["sessions"]
-
-    def test_sessions_list_returns_list(self):
-        data = post("/v1", json={"cmd": "sessions.list"}).json()
-        assert isinstance(data["sessions"], list)
-
-    def test_sessions_destroy_removes_session(self):
-        session_id = post("/v1", json={"cmd": "sessions.create"}).json()["session"]
-        r = post("/v1", json={"cmd": "sessions.destroy", "session": session_id})
-        assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-        assert "removed" in r.json()["message"].lower()
-
-        remaining = post("/v1", json={"cmd": "sessions.list"}).json()["sessions"]
-        assert session_id not in remaining
-
-    def test_sessions_destroy_nonexistent_is_graceful(self):
-        r = post("/v1", json={"cmd": "sessions.destroy", "session": "no-such-session"})
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok"
-        assert "does not exist" in data["message"].lower()
-
-    def test_unknown_command_returns_400(self):
-        r = post("/v1", json={"cmd": "unknown.command"})
-        assert r.status_code == 400
-
-    def test_missing_cmd_returns_422(self):
-        r = post("/v1", json={"url": TEST_URL})
-        assert r.status_code == 422
-
-
-@pytest.mark.browser
-class TestFlareSolverrRequestGet:
-    def test_basic_request_get(self):
-        r = post("/v1", json={
-            "cmd": "request.get",
-            "url": TEST_URL,
-            "maxTimeout": 30000,
-        })
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok"
-        assert data["message"] == "Challenge solved!"
-
-    def test_solution_shape(self):
-        data = post("/v1", json={
-            "cmd": "request.get",
-            "url": TEST_URL,
-            "maxTimeout": 30000,
-        }).json()
-        sol = data["solution"]
-        assert "<html" in sol["response"].lower()
-        assert isinstance(sol["cookies"], list)
-        assert isinstance(sol["userAgent"], str)
-        assert sol["url"].startswith("http")
-        assert sol["status"] == 200
-
-    def test_response_envelope_fields(self):
-        data = post("/v1", json={
-            "cmd": "request.get",
-            "url": TEST_URL,
-            "maxTimeout": 30000,
-        }).json()
-        assert "version" in data
-        assert "startTimestamp" in data
-        assert "endTimestamp" in data
-        assert data["endTimestamp"] >= data["startTimestamp"]
-
-    def test_screenshot_option(self):
-        data = post("/v1", json={
-            "cmd": "request.get",
-            "url": TEST_URL,
-            "screenshot": True,
-            "maxTimeout": 30000,
-        }).json()
-        assert "screenshot" in data["solution"]
-        # Must be valid base64-encoded PNG
-        png_bytes = base64.b64decode(data["solution"]["screenshot"])
-        assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
-
-    def test_missing_url_returns_400(self):
-        r = post("/v1", json={"cmd": "request.get"})
-        assert r.status_code == 400
-
-    def test_with_cookies(self):
-        r = post("/v1", json={
-            "cmd": "request.get",
-            "url": TEST_URL,
-            "cookies": [{"name": "test_cookie", "value": "hello"}],
-            "maxTimeout": 30000,
-        })
-        assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+    def test_metrics_returns_404(self):
+        assert get("/metrics").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -325,24 +103,50 @@ class TestFlareSolverrRequestGet:
 @pytest.mark.browser
 class TestCDPWebSocket:
     def test_websocket_accepts_connection(self):
-        """The /cdp endpoint should accept a WebSocket connection."""
-        try:
-            import websockets
-        except ImportError:
-            pytest.skip("websockets package not installed")
-
-        async def _connect():
-            async with websockets.connect(
-                f"{WS_URL}/cdp",
-                open_timeout=10,
-                close_timeout=5,
-            ) as ws:
-                # Connection accepted — send a no-op CDP message
-                import json
-                await ws.send(json.dumps({"id": 1, "method": "Browser.getVersion", "params": {}}))
-                response = await asyncio.wait_for(ws.recv(), timeout=10)
-                return json.loads(response)
-
-        result = asyncio.run(_connect())
-        # CDP response must have matching id
+        """The /cdp endpoint should relay a basic CDP command."""
+        result = run_cdp(lambda ws: cdp_call(ws, 1, "Browser.getVersion"))
         assert result.get("id") == 1
+        assert "product" in result["result"]
+
+    def test_shared_context_lifecycle(self):
+        """
+        new_context() as Playwright sends it: createBrowserContext is answered
+        with the default context, pages open in it, and dispose closes them.
+        """
+        async def _flow(ws):
+            ctx = await cdp_call(ws, 1, "Target.createBrowserContext", {"disposeOnDetach": True})
+            ctx_id = ctx["result"]["browserContextId"]
+            page = await cdp_call(ws, 2, "Target.createTarget",
+                                  {"url": "about:blank", "browserContextId": ctx_id})
+            target_id = page["result"]["targetId"]
+            targets = await cdp_call(ws, 3, "Target.getTargets")
+            dispose = await cdp_call(ws, 4, "Target.disposeBrowserContext",
+                                     {"browserContextId": ctx_id})
+            await asyncio.sleep(1)  # let Chrome close the page
+            after = await cdp_call(ws, 5, "Target.getTargets")
+            return ctx_id, target_id, targets, dispose, after
+
+        ctx_id, target_id, targets, dispose, after = run_cdp(_flow)
+        infos = {t["targetId"]: t for t in targets["result"]["targetInfos"]}
+        # The new page lives in the default context, i.e. shares the persistent profile
+        assert infos[target_id]["browserContextId"] == ctx_id
+        assert dispose["result"] == {}
+        assert target_id not in {t["targetId"] for t in after["result"]["targetInfos"]}
+
+    def test_leftover_pages_closed_on_disconnect(self):
+        """Pages a client opens but never closes are cleaned up when it disconnects."""
+        async def _open(ws):
+            ctx = await cdp_call(ws, 1, "Target.createBrowserContext")
+            page = await cdp_call(ws, 2, "Target.createTarget",
+                                  {"url": "about:blank",
+                                   "browserContextId": ctx["result"]["browserContextId"]})
+            return page["result"]["targetId"]
+
+        target_id = run_cdp(_open)
+
+        async def _list(ws):
+            await asyncio.sleep(1)
+            return await cdp_call(ws, 1, "Target.getTargets")
+
+        after = run_cdp(_list)
+        assert target_id not in {t["targetId"] for t in after["result"]["targetInfos"]}

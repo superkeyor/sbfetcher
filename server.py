@@ -1,77 +1,67 @@
 """
 SeleniumBase Pure CDP Mode + FastAPI server.
 
-Uses seleniumbase.cdp_driver (async CDP, no WebDriver/chromedriver) for maximum
-stealth — Chrome is driven directly via the Chrome DevTools Protocol.
+Launches ONE headed Chrome via seleniumbase.cdp_driver (async CDP, no
+WebDriver/chromedriver) and exposes its DevTools endpoint at a fixed
+WebSocket address for changedetection.io's Playwright fetcher.
 
-Endpoints (browserless v1/v2 compatible):
-  POST /content              -> { url, [...options] } -> { data: "<html>..." }
-  POST /screenshot           -> { url, [...options] } -> PNG bytes
-  POST /chromium/content     -> alias for /content (browserless v1)
-  POST /chromium/screenshot  -> alias for /screenshot (browserless v1)
-  GET  /health               -> { status: "ok", ... }
-  GET  /metrics              -> basic stats (requests, errors, uptime)
+Endpoints:
+  WS   /cdp     -> Chrome CDP relay (PLAYWRIGHT_DRIVER_URL=ws://<host>:3000/cdp)
+  GET  /health  -> { status: "ok", ... }  (503 + restart attempt when Chrome is down)
 
-FlareSolverr-compatible endpoint:
-  NOT supported by changedetection.io in any form — see notes below.
-  Intended for direct API consumers that speak the FlareSolverr API
-  (e.g. Prowlarr, Radarr, or any app with native FlareSolverr support).
-  POST /v1  -> { cmd: "request.get", url, [maxTimeout, cookies, screenshot] }
-            -> { status, message, solution: { url, response, cookies, userAgent, screenshot? } }
-  POST /v1  -> { cmd: "sessions.create" }  -> { session }
-  POST /v1  -> { cmd: "sessions.list" }    -> { sessions }
-  POST /v1  -> { cmd: "sessions.destroy", session }
-
-changedetection.io integration:
-  Playwright CDP:   PLAYWRIGHT_DRIVER_URL=ws://<host>:3000/cdp
-                    Select "Playwright Chromium/Javascript" fetch method per watch
-  Note: FLARESOLVERR_URL is NOT supported by changedetection.io in any form; proxy-based
-        FlareSolverr integration is not available — use PLAYWRIGHT_DRIVER_URL.
+Stealth on the /cdp path:
+  - Chrome reports its real user-agent (no Windows UA on a Linux browser).
+  - Playwright's new_context() is mapped onto Chrome's default (persistent)
+    browser context, so every check reuses the profile's cookies, including
+    Cloudflare's cf_clearance (CDP_SHARE_DEFAULT_CONTEXT).
+  - A background warm-up task visits WARMUP_URLS with the server-side
+    CAPTCHA solver to keep cf_clearance fresh.
 """
 
 import asyncio
-import base64
-import io
+import itertools
+import json
 import logging
 import os
+import random
+import re
 import tempfile
 import time
-import json
 import urllib.request
-import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Any
 
-import mycdp.network
-import mycdp.page
 import websockets
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from seleniumbase import cdp_driver
-
-# FlareSolverr version string reported in /v1 responses
-FLARESOLVERR_VERSION = "v3.4.6"
 
 # ---------------------------------------------------------------------------
 # Config (env-overridable)
 # ---------------------------------------------------------------------------
 
-LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
-HOST         = os.getenv("HOST", "0.0.0.0")
-PORT         = int(os.getenv("PORT", "3000"))
-PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30"))      # seconds
-WAIT_AFTER   = float(os.getenv("WAIT_AFTER_LOAD", "5"))  # extra settle time (seconds)
-WINDOW_W     = int(os.getenv("WINDOW_WIDTH", "1920"))
-WINDOW_H     = int(os.getenv("WINDOW_HEIGHT", "1080"))
-CHROME_ARGS  = os.getenv("EXTRA_CHROME_ARGS", "")        # space-separated extra flags
-# Set HEADED=true to run Chrome in a virtual Xvfb display (useful for debugging)
-HEADED       = os.getenv("HEADED", "true").lower() in ("1", "true", "yes")
+G_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
+HOST           = os.getenv("HOST", "0.0.0.0")
+PORT           = int(os.getenv("PORT", "3000"))
+WARMUP_TIMEOUT = int(os.getenv("WARMUP_TIMEOUT", "30"))      # warm-up navigation + Cloudflare wait (seconds)
+WINDOW_W       = int(os.getenv("WINDOW_WIDTH", "1920"))
+WINDOW_H       = int(os.getenv("WINDOW_HEIGHT", "1080"))
+CHROME_ARGS    = os.getenv("EXTRA_CHROME_ARGS", "")        # space-separated extra flags
+# Empty        = Chrome's real UA, which matches navigator.platform and client hints.
+# cf_clearance is bound to the UA, so keep it stable once set.
+USER_AGENT     = os.getenv("USER_AGENT", "") or None
+# Set HEADED   = true to run Chrome in a virtual Xvfb display (less detectable than --headless)
+HEADED         = os.getenv("HEADED", "true").lower() in ("1", "true", "yes")
 # Persistent Chrome profile dir; matches CHROME_USER_DATA_DIR in Dockerfile
 CHROME_USER_DATA_DIR = os.getenv("CHROME_USER_DATA_DIR", "/app/chromiumprofile") or None
-# Set DEBUG_SNAPSHOT=false to disable; snapshots land in DEBUG_SNAPSHOT_DIR.
+# Map Playwright's new_context() onto the default (persistent) browser context.
+CDP_SHARE_DEFAULT_CONTEXT = os.getenv("CDP_SHARE_DEFAULT_CONTEXT", "true").lower() in ("1", "true", "yes")
+# Comma-separated URLs revisited every WARMUP_INTERVAL minutes to keep cf_clearance fresh.
+WARMUP_URLS     = [u.strip() for u in os.getenv("WARMUP_URLS", "").split(",") if u.strip()]
+WARMUP_INTERVAL = float(os.getenv("WARMUP_INTERVAL", "60"))
+# Set DEBUG_SNAPSHOT=true to save HTML+PNG after every warm-up visit.
 DEBUG_SNAPSHOT     = os.getenv("DEBUG_SNAPSHOT", "false").lower() in ("1", "true", "yes")
 DEBUG_SNAPSHOT_DIR = os.getenv("DEBUG_SNAPSHOT_DIR", "/tmp/sbfetcher")
 
@@ -81,62 +71,36 @@ log = logging.getLogger("sbfetcher")
 # ---------------------------------------------------------------------------
 # CDP browser state
 #
-# A SINGLE Chrome process is launched at server startup (lifespan) and reused
-# for every request — no new browser is spawned per request.
+# A SINGLE Chrome process is launched at server startup (lifespan) and lives
+# until shutdown.  Playwright clients reach it through the /cdp relay; each
+# client gets its own CDP connection to the same browser.
 #
-# All requests share ONE tab (_tab), which is simply navigated to the new URL
-# via tab.get(url) for each request.  _driver_lock (asyncio.Lock) serializes
-# concurrent requests so only one navigation runs at a time.
+# The server keeps one tab (_tab) of its own, used by the warm-up task and as
+# a liveness ping.  _driver_lock serializes warm-up visits and restarts.
 #
-# The browser is only relaunched when the tab appears dead (detected in
-# _get_or_restart_browser by a failed get_current_url() ping).  Because the
-# session persists across requests, cookies and profile state are retained.
-#
-# cdp_driver speaks directly to Chrome over CDP — no WebDriver, no chromedriver.
+# The browser is relaunched when the tab appears dead (_get_or_restart_browser),
+# triggered by /health, a /cdp connect, or the warm-up task.  The profile in
+# CHROME_USER_DATA_DIR persists cookies (incl. cf_clearance) across restarts.
 # ---------------------------------------------------------------------------
 
 _cdp_driver: Any = None        # cdp_driver instance (the browser process)
-_tab: Any = None               # active CDP tab
+_tab: Any = None               # the server's own CDP tab
 _driver_lock = asyncio.Lock()
 _xvfb_proc: Any = None         # Xvfb subprocess (only when HEADED=True)
-_chrome_cdp_ws_url: str | None = None  # CDP WebSocket endpoint (ws://127.0.0.1:PORT/devtools/browser/UUID)
-_chrome_debug_port: int | None = None  # Chrome remote debugging port (for URL refresh)
-
-# stats
-_stats: dict[str, Any] = {
-    "requests": 0,
-    "errors": 0,
-    "start_time": time.time(),
-}
-
-# FlareSolverr session store: session_id -> { created_at }
-_sessions: dict[str, dict] = {}
+_chrome_debug_port: int | None = None  # Chrome remote debugging port
+_restart_task: asyncio.Task | None = None
+_warmup_task: asyncio.Task | None = None
+_start_time = time.time()
 
 
-# Stealth JS injected before ANY page script runs (via Page.addScriptToEvaluateOnNewDocument).
-# This patches the most common Cloudflare/bot-detection vectors at the Chrome level.
-_STEALTH_JS = """
-// Remove WebDriver automation flag
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true});
-// Ensure window.chrome.runtime exists (absent in headless mode)
-if (!window.chrome) { window.chrome = {}; }
-if (!window.chrome.runtime) { window.chrome.runtime = {}; }
-// Fix Notification permissions query (headless returns 'denied' for 'notifications')
-const __origPermQuery__ = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = (p) =>
-    p.name === 'notifications'
-    ? Promise.resolve({ state: Notification.permission })
-    : __origPermQuery__(p);
-// Set realistic language list
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en'], configurable: true});
-// Spoof non-zero plugin count (headless Chrome has 0 plugins)
-if (navigator.plugins.length === 0) {
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => { const p = [1,2,3]; p.refresh=()=>{}; return p; },
-        configurable: true,
-    });
-}
-"""
+def _fetch_ws_url() -> str:
+    """Return Chrome's current browser-level CDP WebSocket URL (blocking)."""
+    if not _chrome_debug_port:
+        raise RuntimeError("Chrome is not running")
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{_chrome_debug_port}/json/version", timeout=3
+    ) as r:
+        return json.loads(r.read())["webSocketDebuggerUrl"]
 
 
 async def _build_cdp_browser() -> tuple[Any, Any]:
@@ -144,18 +108,14 @@ async def _build_cdp_browser() -> tuple[Any, Any]:
     Launch a new Pure CDP Mode browser and return (driver, tab).
     Extra Chrome flags from EXTRA_CHROME_ARGS are forwarded to the browser.
     """
+    global _chrome_debug_port
     extra = CHROME_ARGS.split() if CHROME_ARGS else []
     # cdp_driver.start_async() launches Chrome with CDP enabled.
     # no_sandbox=True is required inside Docker containers.
-    # agent: Windows Chrome UA is less suspicious than Linux/aarch64.
     driver = await cdp_driver.start_async(
         headless=not HEADED,
         no_sandbox=True,
-        agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/148.0.0.0 Safari/537.36"
-        ),
+        agent=USER_AGENT,
         lang="en-US",
         # browser_executable_path can be set if Chrome is not on PATH;
         # the Dockerfile symlinks chromium-browser onto PATH.
@@ -164,29 +124,15 @@ async def _build_cdp_browser() -> tuple[Any, Any]:
     )
     tab = await driver.get("about:blank")
     await tab.set_window_size(0, 0, WINDOW_W, WINDOW_H)
-    # Inject stealth patches that run before every page's own scripts.
-    try:
-        await tab._send_oneshot(
-            mycdp.page.add_script_to_evaluate_on_new_document(source=_STEALTH_JS)
-        )
-        log.debug("Stealth JS injected via addScriptToEvaluateOnNewDocument")
-    except Exception as _e:
-        log.warning("Stealth JS injection failed (non-fatal): %s", _e)
-    global _chrome_cdp_ws_url, _chrome_debug_port
-    _http_url = driver.get_endpoint_url()  # returns http://127.0.0.1:PORT
-    _chrome_debug_port = urlparse(_http_url).port
-    def _fetch_ws_url_startup():
-        with urllib.request.urlopen(f"{_http_url.rstrip('/')}/json/version", timeout=5) as _r:
-            return json.loads(_r.read()).get("webSocketDebuggerUrl")
-    _chrome_cdp_ws_url = await asyncio.to_thread(_fetch_ws_url_startup)
+    _chrome_debug_port = urlparse(driver.get_endpoint_url()).port
     log.info("Pure CDP browser started (no WebDriver/chromedriver)")
-    log.info("Chrome CDP WebSocket endpoint: %s", _chrome_cdp_ws_url)
+    log.info("Chrome CDP WebSocket endpoint: %s", await asyncio.to_thread(_fetch_ws_url))
     return driver, tab
 
 
 async def _get_or_restart_browser() -> Any:
     """
-    Return the active CDP tab. If the browser has crashed, restart it.
+    Return the server's CDP tab. If the browser has crashed, restart it.
     Must be called while holding _driver_lock.
     """
     global _cdp_driver, _tab
@@ -194,18 +140,31 @@ async def _get_or_restart_browser() -> Any:
         _cdp_driver, _tab = await _build_cdp_browser()
         return _tab
 
-    # Ping the tab — if it raises, the browser has died
+    # Ping the tab — if it raises or hangs, the browser has died
     try:
-        await _tab.get_current_url()
+        await asyncio.wait_for(_tab.get_current_url(), timeout=5)
     except Exception:
         log.warning("CDP tab appears dead — restarting browser")
         try:
-            await _cdp_driver.stop()
+            _cdp_driver.stop()
         except Exception:
             pass
         _cdp_driver, _tab = await _build_cdp_browser()
 
     return _tab
+
+
+async def _ensure_browser() -> None:
+    """Restart Chrome if it has died."""
+    async with _driver_lock:
+        await _get_or_restart_browser()
+
+
+def _schedule_restart() -> None:
+    """Start a background _ensure_browser() unless one is already running."""
+    global _restart_task
+    if _restart_task is None or _restart_task.done():
+        _restart_task = asyncio.create_task(_ensure_browser())
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +173,7 @@ async def _get_or_restart_browser() -> Any:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _xvfb_proc
+    global _xvfb_proc, _warmup_task
     # Startup: launch Xvfb virtual display when running headed
     if HEADED:
         import subprocess
@@ -230,14 +189,21 @@ async def lifespan(app: FastAPI):
     log.info("Starting Pure CDP Mode browser (headless=%s)...", not HEADED)
     async with _driver_lock:
         await _get_or_restart_browser()
+    if WARMUP_URLS:
+        _warmup_task = asyncio.create_task(_warmup_loop())
+        log.info("Warm-up every %s min: %s", WARMUP_INTERVAL, ", ".join(WARMUP_URLS))
     log.info("Server ready")
     yield
-    # Shutdown: stop the browser process cleanly
+    # Shutdown: stop the warm-up task and the browser process
+    if _warmup_task is not None:
+        _warmup_task.cancel()
+        await asyncio.gather(_warmup_task, return_exceptions=True)
+        _warmup_task = None
     global _cdp_driver, _tab
     if _cdp_driver:
         log.info("Stopping CDP browser")
         try:
-            await _cdp_driver.stop()
+            _cdp_driver.stop()
         except Exception:
             pass
         _cdp_driver = None
@@ -256,53 +222,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SeleniumBase CDP Fetcher",
     description=(
-        "Browserless-compatible + FlareSolverr-compatible headless Chrome REST API "
-        "backed by SeleniumBase Pure CDP Mode (no WebDriver/chromedriver)"
+        "Headed Chrome exposed over a CDP WebSocket relay for changedetection.io's "
+        "Playwright fetcher, backed by SeleniumBase Pure CDP Mode (no WebDriver/chromedriver)"
     ),
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-class GotoOptions(BaseModel):
-    waitUntil: str = Field(
-        default="domcontentloaded",
-        description="Puppeteer-style wait strategy (informational; CDP navigates and settles)",
-    )
-    timeout: int = Field(default=PAGE_TIMEOUT * 1000, description="Timeout in ms")
-
-
-class FetchRequest(BaseModel):
-    url: str
-    gotoOptions: GotoOptions = Field(default_factory=GotoOptions)
-    # Extra options passed by changedetection.io / generic callers
-    waitForSelector: str | None = Field(default=None, description="CSS selector to wait for before returning")
-    waitForTimeout: int | None = Field(default=None, description="Extra wait in ms after page load")
-    userAgent: str | None = None
-    cookies: list[dict] | None = None
-    headers: dict[str, str] | None = None
-    javascript: str | None = Field(default=None, description="JS snippet to execute after page load")
-    ignoreHTTPSErrors: bool = True
-    viewport: dict | None = None   # { width, height }
-
-
-class ScreenshotRequest(FetchRequest):
-    fullPage: bool = True
-    type: str = Field(default="png", description="png or jpeg")
-    quality: int | None = None    # only for jpeg
-
-
-class FetchResponse(BaseModel):
-    data: str   # full HTML string
-    url: str    # final URL after redirects
-
-
-# ---------------------------------------------------------------------------
-# Core async CDP browser logic
+# Cloudflare / CAPTCHA handling (used by the warm-up task)
 # All functions must be called while holding _driver_lock.
 # ---------------------------------------------------------------------------
 
@@ -700,217 +629,100 @@ async def _save_debug_snapshot(
         log.warning("_save_debug_snapshot failed (non-fatal): %s", exc)
 
 
-async def _cdp_navigate(tab: Any, req: FetchRequest) -> None:
-    """
-    Apply request options (viewport, user-agent, headers, cookies) and
-    navigate to req.url. Leaves the tab on the loaded page.
-    """
-    # Viewport resize
-    if req.viewport:
-        w = req.viewport.get("width", WINDOW_W)
-        h = req.viewport.get("height", WINDOW_H)
-        await tab.set_window_size(0, 0, w, h)
+def _classify_page(title: str, html: str) -> str:
+    """Return "blocked", "challenge" or "ok" for a loaded page (Cloudflare or DataDome)."""
+    if (
+        "Sorry, you have been blocked" in html
+        or ("cf-error-details" in html and "_cf_chl_opt" not in html)
+        or "'t':'bv'" in html  # DataDome hard block
+    ):
+        return "blocked"
+    if (
+        title.startswith("Just a moment")
+        or "_cf_chl_opt" in html
+        or 'id="challenge-' in html
+        or "captcha-delivery.com" in html  # DataDome device check / captcha
+    ):
+        return "challenge"
+    return "ok"
 
-    # User-agent override via CDP evaluate
-    if req.userAgent:
-        await tab.evaluate(
-            f"Object.defineProperty(navigator, 'userAgent', "
-            f"{{get: () => {repr(req.userAgent)}}})"
-        )
 
-    # Compute timeout from gotoOptions (falls back to global PAGE_TIMEOUT)
-    timeout_s = (req.gotoOptions.timeout / 1000) if req.gotoOptions else PAGE_TIMEOUT
-
-    # Navigate
-    await tab.get(req.url, timeout=timeout_s)
-
-    # Inject cookies after initial load (must be on the target domain first)
-    if req.cookies:
-        for cookie in req.cookies:
-            try:
-                await tab.set_all_cookies([cookie])
-            except Exception as e:
-                log.warning("Cookie error: %s", e)
-        # Reload so cookies take effect
-        await tab.get(req.url, timeout=timeout_s)
-
-    # Extra settle time
-    extra_s = (req.waitForTimeout / 1000.0) if req.waitForTimeout else WAIT_AFTER
-    if extra_s > 0:
-        await tab.sleep(extra_s)
-
-    # Attempt to solve any CAPTCHA challenge present after page load
-    await _solve_captcha_if_present(tab)
-
-    # Wait for a CSS selector if requested
-    if req.waitForSelector:
+async def _solve_challenge(tab: Any) -> bool:
+    """Click a CAPTCHA, preferring SeleniumBase's native async solver."""
+    if hasattr(tab, "solve_captcha"):
         try:
-            await tab.wait_for(selector=req.waitForSelector, timeout=timeout_s)
-        except Exception as e:
-            log.warning("waitForSelector '%s' timed out: %s", req.waitForSelector, e)
+            return bool(await tab.solve_captcha())
+        except Exception as exc:
+            log.debug("native solve_captcha failed, using fallback: %s", exc)
+    return await _solve_captcha_if_present(tab)
 
-    # Execute custom JS snippet
-    if req.javascript:
+
+async def _wait_for_cloudflare(tab: Any, timeout_s: float) -> str:
+    """
+    Poll the current page until Cloudflare/DataDome lets it through.
+    Waits passively for the first few seconds (managed challenges and device
+    checks often clear on their own), then clicks the CAPTCHA every few seconds.
+    Returns the final page state from _classify_page().
+    """
+    start = time.monotonic()
+    last_click: float | None = None
+    seen_challenge = False
+    ok_streak = 0
+    while True:
+        elapsed = time.monotonic() - start
         try:
-            await tab.evaluate(req.javascript)
-        except Exception as e:
-            log.warning("JS execution error: %s", e)
+            title = await tab.get_title() or ""
+            html = await tab.get_page_source() or ""
+            state = _classify_page(title, html)
+        except Exception as exc:
+            # Page is mid-navigation (e.g. the challenge just redirected)
+            log.debug("_wait_for_cloudflare: page not readable yet: %s", exc)
+            state = "challenge"
+        if state == "challenge" and not seen_challenge:
+            seen_challenge = True
+            log.info("challenge detected on %s — waiting", await tab.get_current_url())
+        ok_streak = ok_streak + 1 if state == "ok" else 0
+        # After a challenge, the reload can briefly show an empty document: confirm "ok" twice
+        if state == "ok" and seen_challenge and ok_streak < 2 and elapsed < timeout_s:
+            await tab.sleep(1)
+            continue
+        if state != "challenge" or elapsed >= timeout_s:
+            if seen_challenge:
+                log.info("challenge ended as %r after %.1fs", state, elapsed)
+            return state
+        if elapsed >= 6 and (last_click is None or time.monotonic() - last_click >= 8):
+            last_click = time.monotonic()
+            await _solve_challenge(tab)
+        await tab.sleep(1)
 
 
-async def _do_fetch(req: FetchRequest) -> tuple[str, str]:
-    """
-    Navigate to req.url via Pure CDP and return (html, final_url).
-    Must be called while holding _driver_lock.
-    """
-    tab = await _get_or_restart_browser()
-    await _cdp_navigate(tab, req)
-    html = await tab.get_page_source()
+async def _warm_url(tab: Any, url: str) -> None:
+    """Visit url and get through any Cloudflare check, refreshing cf_clearance."""
+    # tab.get() has no timeout of its own (extra kwargs only change its code path)
+    await asyncio.wait_for(tab.get(url), timeout=WARMUP_TIMEOUT)
+    state = await _wait_for_cloudflare(tab, WARMUP_TIMEOUT)
     final_url = await tab.get_current_url()
-    await _save_debug_snapshot(tab, final_url, html=html)
-    return html, final_url
+    if state == "ok":
+        log.info("warm-up: %s ok", final_url)
+    else:
+        log.warning("warm-up: %s still %s after %ss", url, state, WARMUP_TIMEOUT)
+    await _save_debug_snapshot(tab, final_url)
+    # Park the tab so it isn't running the site's scripts between rounds
+    await tab.get("about:blank")
 
 
-async def _do_screenshot(req: ScreenshotRequest) -> bytes:
-    """
-    Navigate to req.url via Pure CDP and return a screenshot as raw bytes.
-    Must be called while holding _driver_lock.
-    """
-    tab = await _get_or_restart_browser()
-    await _cdp_navigate(tab, req)
-
-    # Expand window height for full-page capture
-    if req.fullPage:
-        total_height = await tab.evaluate("document.body.scrollHeight")
-        await tab.set_window_size(0, 0, WINDOW_W, int(total_height or WINDOW_H))
-        await tab.sleep(0.3)
-
-    # save_screenshot writes a PNG to a temp file
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    await tab.save_screenshot(filename=tmp_path)
-
-    with open(tmp_path, "rb") as f:
-        png_bytes = f.read()
-
-    os.unlink(tmp_path)
-
-    await _save_debug_snapshot(tab, req.url, png_bytes=png_bytes)
-
-    # Convert to JPEG if requested
-    if req.type == "jpeg":
-        try:
-            from PIL import Image
-            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=req.quality or 85)
-            return buf.getvalue()
-        except ImportError:
-            log.warning("Pillow not available — returning PNG despite jpeg request")
-
-    return png_bytes
-
-
-async def _do_flaresolverr_fetch(req: "FlareSolverrRequest") -> dict:
-    """
-    Execute a FlareSolverr request.get via Pure CDP.
-    Returns the full FlareSolverr solution dict.
-    Must be called while holding _driver_lock.
-    """
-    tab = await _get_or_restart_browser()
-
-    # Apply user-agent override
-    if req.userAgent:
-        await tab.set_user_agent(req.userAgent)
-
-    # Apply extra request headers by patching window.fetch
-    if req.headers:
-        headers_js = repr(req.headers)
-        await tab.evaluate(
-            f"""
-            const _origFetch = window.fetch;
-            window.fetch = (url, opts = {{}}) => {{
-                opts.headers = Object.assign({headers_js}, opts.headers || {{}});
-                return _origFetch(url, opts);
-            }};
-            """
-        )
-
-    # Navigate
-    timeout_s = (req.maxTimeout or 60000) / 1000.0
-    await tab.get(req.url, timeout=timeout_s)
-
-    # Apply cookies
-    if req.cookies:
-        for cookie in req.cookies:
+async def _warmup_loop() -> None:
+    """Revisit WARMUP_URLS every WARMUP_INTERVAL minutes (jittered)."""
+    while True:
+        for url in WARMUP_URLS:
             try:
-                await tab.send(
-                    mycdp.network.set_cookie(
-                        name=cookie.get("name", ""),
-                        value=cookie.get("value", ""),
-                        url=req.url,
-                        domain=cookie.get("domain") or None,
-                        path=cookie.get("path") or None,
-                        secure=cookie.get("secure") or None,
-                        http_only=cookie.get("httpOnly") or None,
-                    )
-                )
-            except Exception as e:
-                log.warning("FlareSolverr cookie error: %s", e)
-        await tab.get(req.url, timeout=timeout_s)
-
-    # Settle
-    await tab.sleep(WAIT_AFTER)
-
-    # Attempt to solve any CAPTCHA challenge present
-    await _solve_captcha_if_present(tab)
-
-    # Collect results
-    html = await tab.get_page_source()
-    final_url = await tab.get_current_url()
-    user_agent = await tab.get_user_agent()
-
-    # Normalize cookies to FlareSolverr format
-    try:
-        raw_cookies = await tab.send(mycdp.network.get_all_cookies())
-    except Exception:
-        raw_cookies = []
-    fs_cookies = [
-        {
-            "name": c.name if hasattr(c, "name") else c.get("name", ""),
-            "value": c.value if hasattr(c, "value") else c.get("value", ""),
-            "domain": c.domain if hasattr(c, "domain") else c.get("domain", ""),
-            "path": c.path if hasattr(c, "path") else c.get("path", "/"),
-            "expires": c.expires if hasattr(c, "expires") else c.get("expires", -1),
-            "size": len(c.name if hasattr(c, "name") else c.get("name", "")) + len(c.value if hasattr(c, "value") else c.get("value", "")),
-            "httpOnly": c.http_only if hasattr(c, "http_only") else c.get("httpOnly", False),
-            "secure": c.secure if hasattr(c, "secure") else c.get("secure", False),
-            "session": (c.expires if hasattr(c, "expires") else c.get("expires", -1)) == -1,
-            "sameSite": str(c.same_site) if hasattr(c, "same_site") else c.get("sameSite", "None"),
-        }
-        for c in (raw_cookies or [])
-    ]
-
-    solution: dict[str, Any] = {
-        "url": final_url,
-        "status": 200,
-        "cookies": fs_cookies,
-        "userAgent": user_agent,
-        "headers": {},    # CDP doesn't expose response headers through this path
-        "response": html,
-    }
-
-    # Optional screenshot (base64 PNG)
-    if req.screenshot:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        await tab.save_screenshot(filename=tmp_path)
-        with open(tmp_path, "rb") as f:
-            solution["screenshot"] = base64.b64encode(f.read()).decode()
-        os.unlink(tmp_path)
-
-    await _save_debug_snapshot(tab, final_url, html=html)
-    return solution
+                async with _driver_lock:
+                    tab = await _get_or_restart_browser()
+                    await _warm_url(tab, url)
+            except Exception:
+                log.exception("warm-up failed for %s", url)
+            await asyncio.sleep(random.uniform(2, 8))
+        await asyncio.sleep(WARMUP_INTERVAL * 60 * random.uniform(0.9, 1.1))
 
 
 # ---------------------------------------------------------------------------
@@ -919,77 +731,157 @@ async def _do_flaresolverr_fetch(req: "FlareSolverrRequest") -> dict:
 
 @app.get("/")
 async def root():
-    """API root — service info and links to docs."""
+    """API root — service info and links."""
     return {
         "service": "sbfetcher",
-        "docs": "/docs",
+        "cdp": "/cdp",
         "health": "/health",
-        "metrics": "/metrics",
+        "docs": "/docs",
     }
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(status_code=204)
 
 
 @app.get("/health")
 async def health():
-    """Liveness/readiness probe."""
-    uptime = time.time() - _stats["start_time"]
+    """Liveness/readiness probe. Returns 503 and kicks off a restart if Chrome is down."""
+    uptime = round(time.time() - _start_time, 1)
+    try:
+        await asyncio.to_thread(_fetch_ws_url)
+    except Exception as exc:
+        _schedule_restart()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "down",
+                "error": str(exc),
+                "uptime_seconds": uptime,
+                "browser_active": False,
+                "mode": "pure-cdp",
+            },
+        )
     return {
         "status": "ok",
-        "uptime_seconds": round(uptime, 1),
-        "browser_active": _tab is not None,
+        "uptime_seconds": uptime,
+        "browser_active": True,
         "mode": "pure-cdp",
     }
 
 
-@app.get("/metrics")
-async def metrics():
-    """Basic request counters."""
-    uptime = time.time() - _stats["start_time"]
-    return {
-        "requests_total": _stats["requests"],
-        "errors_total": _stats["errors"],
-        "uptime_seconds": round(uptime, 1),
-        "error_rate": (
-            round(_stats["errors"] / _stats["requests"], 4) if _stats["requests"] else 0
-        ),
-    }
+# ---------------------------------------------------------------------------
+# WebSocket /cdp relay
+# ---------------------------------------------------------------------------
+
+# Message ids for relay-originated CDP calls; Playwright counts up from 1.
+_PRIVATE_ID_BASE = 1_000_000_000
+# Chrome serializes replies as {"id":N,...}; lets us spot ids without parsing big frames.
+_REPLY_ID = re.compile(r'^\{"id":(\d+),')
+
+
+async def _default_context_id(chrome_ws: Any) -> str | None:
+    """
+    Ask Chrome for the default browser context id, i.e. the context of the
+    server's own tab. Must run before the relay starts forwarding.
+    """
+    msg_id = _PRIVATE_ID_BASE - 1
+    await chrome_ws.send(json.dumps({"id": msg_id, "method": "Target.getTargets"}))
+    while True:
+        reply = json.loads(await asyncio.wait_for(chrome_ws.recv(), timeout=5))
+        if reply.get("id") == msg_id:
+            break
+    infos = reply.get("result", {}).get("targetInfos", [])
+    own_id = getattr(getattr(_tab, "target", None), "target_id", None)
+    for info in infos:
+        if info.get("targetId") == own_id:
+            return info.get("browserContextId")
+    for info in infos:
+        if info.get("type") == "page" and info.get("browserContextId"):
+            return info["browserContextId"]
+    return None
 
 
 @app.websocket("/cdp")
 async def cdp_ws_proxy(client_ws: WebSocket):
     """
-    WebSocket proxy: exposes Chrome's CDP endpoint at a fixed address.
-    Playwright connect_over_cdp() connects here; messages are forwarded
-    transparently to Chrome's internal CDP WebSocket.
+    WebSocket relay: exposes Chrome's CDP endpoint at a fixed address.
+    Playwright connect_over_cdp() connects here.
 
-    changedetection.io: set PLAYWRIGHT_DRIVER_URL=ws://seleniumbase-fetcher:3000/cdp
+    With CDP_SHARE_DEFAULT_CONTEXT, Playwright's new_context() is answered with
+    Chrome's default browser context instead of a fresh incognito one, so its
+    pages reuse the persistent profile (cookies, cf_clearance).  Pages the
+    client opened are closed when it disposes that context or disconnects.
+    Contexts requested with their own proxy are left alone.
+    Everything else is forwarded unchanged.
+
+    changedetection.io: set PLAYWRIGHT_DRIVER_URL=ws://sbfetcher:3000/cdp
     """
     await client_ws.accept()
-    if not _chrome_cdp_ws_url:
-        await client_ws.close(code=1013)  # service unavailable, try again later
-        return
-    # Refresh URL in case Chrome was restarted since last startup
-    cdp_url = _chrome_cdp_ws_url
-    if _chrome_debug_port:
+    try:
+        cdp_url = await asyncio.to_thread(_fetch_ws_url)
+    except Exception:
+        log.warning("CDP proxy: Chrome unreachable — restarting browser")
         try:
-            _port = _chrome_debug_port
-            def _fetch_fresh_ws_url():
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{_port}/json/version", timeout=3
-                ) as _r:
-                    return json.loads(_r.read()).get("webSocketDebuggerUrl")
-            fresh = await asyncio.to_thread(_fetch_fresh_ws_url)
-            if fresh:
-                cdp_url = fresh
-        except Exception as _e:
-            log.debug("CDP proxy: could not refresh URL: %s", _e)
+            await _ensure_browser()
+            cdp_url = await asyncio.to_thread(_fetch_ws_url)
+        except Exception as e:
+            log.warning("CDP proxy: browser restart failed: %s", e)
+            await client_ws.close(code=1013)  # service unavailable, try again later
+            return
     log.info("CDP proxy: client connected, forwarding to %s", cdp_url)
     try:
         async with websockets.connect(cdp_url, ping_interval=None, max_size=2**28) as chrome_ws:
+            default_ctx = None
+            if CDP_SHARE_DEFAULT_CONTEXT:
+                try:
+                    default_ctx = await _default_context_id(chrome_ws)
+                except Exception as e:
+                    log.warning("CDP proxy: could not read default context: %s", e)
+                if not default_ctx:
+                    log.warning("CDP proxy: default context unknown — not sharing it")
+
+            private_ids = itertools.count(_PRIVATE_ID_BASE)
+            swallow: set[int] = set()            # replies to relay-originated calls
+            create_target_ids: set[int] = set()  # client ids of Target.createTarget
+            opened_targets: set[str] = set()     # pages this client opened
+
+            async def reply(req: dict, result: dict) -> None:
+                msg = {"id": req["id"], "result": result}
+                if "sessionId" in req:
+                    msg["sessionId"] = req["sessionId"]
+                await client_ws.send_text(json.dumps(msg))
+
+            async def close_opened_targets() -> None:
+                for target_id in list(opened_targets):
+                    msg_id = next(private_ids)
+                    swallow.add(msg_id)
+                    await chrome_ws.send(json.dumps({
+                        "id": msg_id,
+                        "method": "Target.closeTarget",
+                        "params": {"targetId": target_id},
+                    }))
+                opened_targets.clear()
+
+            async def intercept(msg: str) -> str | None:
+                """Map context calls onto the default context. None = answered here."""
+                try:
+                    req = json.loads(msg)
+                except ValueError:
+                    return msg
+                method = req.get("method")
+                params = req.get("params") or {}
+                if method == "Target.createBrowserContext" and not params.get("proxyServer"):
+                    await reply(req, {"browserContextId": default_ctx})
+                    return None
+                if method == "Target.disposeBrowserContext" and params.get("browserContextId") == default_ctx:
+                    await close_opened_targets()
+                    await reply(req, {})
+                    return None
+                if params.get("browserContextId") == default_ctx:
+                    if method == "Target.createTarget":
+                        create_target_ids.add(req["id"])
+                    # Chrome addresses the default context by omitting the id
+                    del params["browserContextId"]
+                    return json.dumps(req)
+                return msg
+
             async def forward_in():
                 try:
                     while True:
@@ -998,6 +890,8 @@ async def cdp_ws_proxy(client_ws: WebSocket):
                             break
                         elif data["type"] == "websocket.receive":
                             msg = data.get("text") or data.get("bytes")
+                            if msg is not None and default_ctx and isinstance(msg, str):
+                                msg = await intercept(msg)
                             if msg is not None:
                                 await chrome_ws.send(msg)
                 except Exception:
@@ -1006,6 +900,17 @@ async def cdp_ws_proxy(client_ws: WebSocket):
             async def forward_out():
                 try:
                     async for msg in chrome_ws:
+                        if isinstance(msg, str) and (swallow or create_target_ids):
+                            m = _REPLY_ID.match(msg)
+                            msg_id = int(m.group(1)) if m else None
+                            if msg_id in swallow:
+                                swallow.discard(msg_id)
+                                continue
+                            if msg_id in create_target_ids:
+                                create_target_ids.discard(msg_id)
+                                target_id = json.loads(msg).get("result", {}).get("targetId")
+                                if target_id:
+                                    opened_targets.add(target_id)
                         if isinstance(msg, bytes):
                             await client_ws.send_bytes(msg)
                         else:
@@ -1020,6 +925,24 @@ async def cdp_ws_proxy(client_ws: WebSocket):
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+            # Client left without disposing its context: close its pages ourselves
+            if opened_targets:
+                log.info("CDP proxy: closing %d page(s) left open by client", len(opened_targets))
+                try:
+                    await close_opened_targets()
+
+                    async def drain():
+                        async for msg in chrome_ws:
+                            m = isinstance(msg, str) and _REPLY_ID.match(msg)
+                            if m:
+                                swallow.discard(int(m.group(1)))
+                            if not swallow:
+                                return
+
+                    await asyncio.wait_for(drain(), timeout=3)
+                except Exception as e:
+                    log.debug("CDP proxy: closing leftover pages failed: %s", e)
     except Exception as e:
         log.warning("CDP proxy error: %s", e)
     finally:
@@ -1030,184 +953,12 @@ async def cdp_ws_proxy(client_ws: WebSocket):
     log.info("CDP proxy: client disconnected")
 
 
-@app.post("/content")
-async def fetch_content(req: FetchRequest):
-    """
-    Fetch a URL using Pure CDP headless Chrome and return the rendered HTML.
-    Compatible with the browserless /content endpoint.
-    Response: { data: "<html>...", url: "<final-url>" }
-    """
-    _stats["requests"] += 1
-    log.info("fetch_content: %s", req.url)
-    try:
-        async with _driver_lock:
-            html, final_url = await _do_fetch(req)
-        return FetchResponse(data=html, url=final_url)
-    except Exception as e:
-        _stats["errors"] += 1
-        log.exception("fetch_content error for %s", req.url)
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-# Alias: changedetection.io may POST to /chromium/content (browserless v1 path)
-@app.post("/chromium/content")
-async def fetch_content_chromium(req: FetchRequest):
-    """Alias for /content — browserless v1 compatibility."""
-    return await fetch_content(req)
-
-
-@app.post("/screenshot")
-async def screenshot(req: ScreenshotRequest):
-    """
-    Navigate to a URL via Pure CDP and return a screenshot as image/png (or image/jpeg).
-    Compatible with the browserless /screenshot endpoint.
-    Response: raw image bytes.
-    """
-    _stats["requests"] += 1
-    log.info("screenshot: %s (fullPage=%s, type=%s)", req.url, req.fullPage, req.type)
-    try:
-        async with _driver_lock:
-            img_bytes = await _do_screenshot(req)
-        media_type = "image/jpeg" if req.type == "jpeg" else "image/png"
-        return Response(content=img_bytes, media_type=media_type)
-    except Exception as e:
-        _stats["errors"] += 1
-        log.exception("screenshot error for %s", req.url)
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-# Alias: browserless v1 path
-@app.post("/chromium/screenshot")
-async def screenshot_chromium(req: ScreenshotRequest):
-    """Alias for /screenshot — browserless v1 compatibility."""
-    return await screenshot(req)
-
-
-# ---------------------------------------------------------------------------
-# FlareSolverr-compatible /v1 endpoint
-# ---------------------------------------------------------------------------
-# Request contract: POST /v1  { cmd, url, maxTimeout, cookies, session, screenshot }
-# Response contract: { status, message, solution: { url, status, cookies, userAgent,
-#                       headers, response, screenshot? }, startTimestamp, endTimestamp,
-#                       version }
-
-class FlareSolverrRequest(BaseModel):
-    cmd: str = Field(description="Command: request.get | sessions.create | sessions.list | sessions.destroy")
-    url: str | None = None
-    maxTimeout: int = Field(default=60000, description="Timeout in ms")
-    cookies: list[dict] | None = None
-    session: str | None = Field(default=None, description="Session ID for persistent sessions")
-    # If true, include a base64 PNG in solution.screenshot
-    screenshot: bool = False
-    userAgent: str | None = None
-    headers: dict[str, str] | None = None
-
-
-@app.post("/v1")
-async def flaresolverr_v1(req: FlareSolverrRequest):
-    """
-    FlareSolverr-compatible /v1 endpoint.
-    Supports: request.get, sessions.create, sessions.list, sessions.destroy
-
-    Intended for direct API consumers that speak the FlareSolverr API
-    (e.g. Prowlarr, Radarr, or any app with native FlareSolverr support).
-
-    changedetection.io does NOT support FlareSolverr in any form:
-      - FLARESOLVERR_URL env var is silently ignored (dgtlmoon/changedetection.io#2445).
-      - Configuring http://<host>:3000 as an HTTP proxy also fails
-        (ERR_TUNNEL_CONNECTION_FAILED) — FlareSolverr is an API, not an
-        HTTP CONNECT proxy.
-    Use PLAYWRIGHT_DRIVER_URL=ws://<host>:3000/cdp instead.
-    """
-    start_ts = int(time.time() * 1000)
-    _stats["requests"] += 1
-    log.info("flaresolverr_v1: cmd=%s url=%s", req.cmd, req.url)
-
-    # --- sessions.create ---
-    if req.cmd == "sessions.create":
-        session_id = str(uuid.uuid4())
-        _sessions[session_id] = {"created_at": time.time()}
-        end_ts = int(time.time() * 1000)
-        return {
-            "status": "ok",
-            "message": "Session created successfully.",
-            "session": session_id,
-            "startTimestamp": start_ts,
-            "endTimestamp": end_ts,
-            "version": FLARESOLVERR_VERSION,
-        }
-
-    # --- sessions.list ---
-    if req.cmd == "sessions.list":
-        end_ts = int(time.time() * 1000)
-        return {
-            "status": "ok",
-            "message": "",
-            "sessions": list(_sessions.keys()),
-            "startTimestamp": start_ts,
-            "endTimestamp": end_ts,
-            "version": FLARESOLVERR_VERSION,
-        }
-
-    # --- sessions.destroy ---
-    if req.cmd == "sessions.destroy":
-        sid = req.session
-        if sid and sid in _sessions:
-            del _sessions[sid]
-            msg = "The session has been removed."
-        else:
-            msg = "The session does not exist."
-        end_ts = int(time.time() * 1000)
-        return {
-            "status": "ok",
-            "message": msg,
-            "startTimestamp": start_ts,
-            "endTimestamp": end_ts,
-            "version": FLARESOLVERR_VERSION,
-        }
-
-    # --- request.get ---
-    if req.cmd == "request.get":
-        if not req.url:
-            raise HTTPException(status_code=400, detail="url is required for request.get")
-        try:
-            async with _driver_lock:
-                solution = await _do_flaresolverr_fetch(req)
-            end_ts = int(time.time() * 1000)
-            return {
-                "status": "ok",
-                "message": "Challenge solved!",
-                "solution": solution,
-                "startTimestamp": start_ts,
-                "endTimestamp": end_ts,
-                "version": FLARESOLVERR_VERSION,
-            }
-        except Exception as e:
-            _stats["errors"] += 1
-            log.exception("flaresolverr_v1 request.get error for %s", req.url)
-            end_ts = int(time.time() * 1000)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "message": str(e),
-                    "startTimestamp": start_ts,
-                    "endTimestamp": end_ts,
-                    "version": FLARESOLVERR_VERSION,
-                },
-            )
-
-    # Unknown command
-    raise HTTPException(status_code=400, detail=f"Unknown cmd: {req.cmd!r}")
-
-
 # ---------------------------------------------------------------------------
 # Global exception handler — return JSON instead of HTML 500s
 # ---------------------------------------------------------------------------
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    _stats["errors"] += 1
     log.exception("Unhandled exception: %s", exc)
     return JSONResponse(status_code=500, content={"error": str(exc)})
 

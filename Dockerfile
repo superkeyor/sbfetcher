@@ -18,7 +18,7 @@ ARG TARGETARCH
 # Labels
 # =============================================================================
 LABEL maintainer="superkeyor"
-LABEL description="SeleniumBase Pure CDP + FastAPI — Playwright WSDriverURL, FlareSolverr, and browserless-compatible headless Chrome fetcher"
+LABEL description="SeleniumBase Pure CDP + FastAPI — headed Chrome behind a CDP WebSocket relay for changedetection.io Playwright"
 LABEL org.opencontainers.image.title="sbfetcher"
 
 # =============================================================================
@@ -30,8 +30,15 @@ ENV PYTHONUNBUFFERED=1
 # Server defaults — all overridable at runtime via docker run -e or compose
 ENV HOST=0.0.0.0
 ENV PORT=3000
-ENV PAGE_TIMEOUT=30
-ENV WAIT_AFTER_LOAD=5
+# Warm-up navigation + Cloudflare wait (seconds)
+ENV WARMUP_TIMEOUT=30
+# Comma-separated Cloudflare sites to revisit every WARMUP_INTERVAL minutes (empty = off)
+ENV WARMUP_URLS=""
+ENV WARMUP_INTERVAL=60
+# Map Playwright's new_context() onto the persistent profile
+ENV CDP_SHARE_DEFAULT_CONTEXT=true
+# Empty = Chrome's real user-agent
+ENV USER_AGENT=""
 ENV WINDOW_WIDTH=1920
 ENV WINDOW_HEIGHT=1080
 ENV LOG_LEVEL=INFO
@@ -42,7 +49,7 @@ ENV HEADED=true
 ENV CHROME_USER_DATA_DIR=/app/chromiumprofile
 # Extra space-separated Chrome flags, e.g. --proxy-server=http://proxy:8080
 ENV EXTRA_CHROME_ARGS=""
-# Debug snapshots: set DEBUG_SNAPSHOT=true to save HTML+PNG after every request.
+# Debug snapshots: set DEBUG_SNAPSHOT=true to save HTML+PNG after every warm-up visit.
 # NOTE: DEBUG_SNAPSHOT_DIR defaults to /tmp/sbfetcher which lives on the tmpfs
 # mount defined in docker-compose.yml — snapshots are RAM-only and lost on restart.
 # Override DEBUG_SNAPSHOT_DIR to a volume-backed path to persist them.
