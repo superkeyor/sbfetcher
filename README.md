@@ -6,6 +6,8 @@ designed as a stealthy Playwright browser for [changedetection.io](https://githu
 
 Supports **linux/amd64** and **linux/arm64** (OCI/Oracle Cloud, Raspberry Pi, M-series Mac via Rosetta).
 
+How it works inside (architecture, concurrency, gotchas, development): see [AGENTS.md](AGENTS.md).
+
 ---
 
 ## Endpoints

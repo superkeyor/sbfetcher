@@ -18,6 +18,7 @@ venv/
 ._*
 Thumbs.db
 README.md
+AGENTS.md
 LICENSE
 docker-compose*.y*ml
 upload
