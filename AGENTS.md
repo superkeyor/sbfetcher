@@ -28,8 +28,8 @@ ONE Chrome process tree, ONE profile  <-- SeleniumBase tab (the server's own CDP
 ### How SeleniumBase is used
 
 Only `seleniumbase.cdp_driver` (Pure CDP mode). No WebDriver, no chromedriver, no SeleniumBase test framework.
-It (1) launches Chrome (`start_async`: profile dir, language, flags, headed under the Xvfb display that `lifespan`
-starts), (2) provides the server's own tab (`_tab`) for warm-ups: navigate, read the page, scroll, bring to front,
+It (1) launches Chrome (`start_async`: profile dir, language, flags, headed under the Xvfb display that `start.sh`
+starts via the base image's `vnc-start`), (2) provides the server's own tab (`_tab`) for warm-ups: navigate, read the page, scroll, bring to front,
 click CAPTCHAs (`solve_captcha`, with `_solve_captcha_if_present` as a fallback), and (3) manages the process
 (`get_endpoint_url()` gives the debugging port, `stop()` shuts it down). Two CDP clients drive the same Chrome at
 once, the SeleniumBase tab and Playwright; Chrome allows that.
@@ -77,6 +77,9 @@ rebrowser-patches).
 
 - `tab.get()` has no timeout and ignores extra keyword arguments (they only change its code path): wrap it in
   `asyncio.wait_for`.
+- On Linux, `cdp_driver.start_async` starts its own 1366x768 Xvfb (`:1001`) unless it gets `headed=True`;
+  `headless=False` alone is not enough. Chrome then ignores the base image's `:99` and the VNC viewer shows an
+  empty screen. Check with `pgrep -a Xvfb`: there must be exactly one.
 - `cdp_driver.start_async` silently ignores unknown keyword arguments. Chrome flags go in `browser_args`;
   `extra_chromium_args` is not a parameter, which made `EXTRA_CHROME_ARGS` a no-op until it was fixed.
 - Scroll gestures and screenshots need a *visible* tab. `bring_to_front()` in the warm-up hides other tabs of the
@@ -98,7 +101,9 @@ rebrowser-patches).
 - `server.py`: config (env), Chrome launch/restart, profile trim, CAPTCHA/Cloudflare/DataDome handling and the
   warm-up (`_warm_url`, `_wait_for_cloudflare`, `_classify_page`), per-host memory (`_hosts`, `_should_warm`,
   `_note_document_response`), the `/cdp` relay (`cdp_ws_proxy`), `/health`.
-- `test.py` (pytest against a running server), `test.sh` (manual commands), `Dockerfile`, `docker-compose.yml`
+- `Dockerfile`: `superkeyor/chromiumkit` (sibling repo: Debian Chromium, Xvfb, x11vnc/noVNC via `vnc-start`) plus
+  Miniforge and tini, laid out like the sibling `dockerapp_template`. `start.sh` runs `vnc-start`, then the server.
+- `test.py` (pytest against a running server), `test.sh` (manual commands), `docker-compose.yml`
   (+ override for local dev), `upload` (git commit/push plus multi-arch Docker Hub push), `start.sh`.
 
 ### Developing and testing

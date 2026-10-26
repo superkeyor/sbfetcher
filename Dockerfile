@@ -1,18 +1,13 @@
 # =============================================================================
 # Base Image
 # =============================================================================
-# Miniforge3 (Ubuntu + mamba + conda-forge)
-# https://hub.docker.com/r/condaforge/miniforge3/tags
-# Fixed version to avoid unexpected rebuilds
-FROM condaforge/miniforge3:26.1.1-2
-
-# =============================================================================
-# Build Args
-# =============================================================================
-# TARGETARCH is auto-injected by docker buildx for multi-platform builds.
-# It must be declared here so the Chrome installation case statement below
-# can read it. Values: amd64 | arm64
-ARG TARGETARCH
+# chromiumkit: Debian + Chromium + Xvfb + x11vnc + noVNC (`vnc-start`, ENABLE_VNC, VNC_PASSWORD, port 6080)
+# https://hub.docker.com/r/superkeyor/chromiumkit
+# Miniforge (mamba + conda environments) is added below, as in dockerapp_template.
+# Install steps borrowed from the official (Ubuntu-only) miniforge3 image:
+# https://github.com/conda-forge/miniforge-images/blob/main/ubuntu/Dockerfile
+FROM superkeyor/chromiumkit:latest
+ARG MINIFORGE_VERSION=26.9.4-0
 
 # =============================================================================
 # Labels
@@ -22,11 +17,30 @@ LABEL description="SeleniumBase Pure CDP + FastAPI — headed Chrome behind a CD
 LABEL org.opencontainers.image.title="sbfetcher"
 
 # =============================================================================
+# Miniforge
+# =============================================================================
+ENV CONDA_DIR=/opt/conda
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+ENV PATH=${CONDA_DIR}/bin:${PATH}
+
+# tini: PID 1 init (signal forwarding, zombie reaping), as in the official image
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends wget ca-certificates tini && \
+    rm -rf /var/lib/apt/lists/* && \
+    wget --no-hsts -q "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-$(uname -m).sh" -O /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p ${CONDA_DIR} && \
+    rm /tmp/miniforge.sh && \
+    find ${CONDA_DIR} -follow -type f \( -name '*.a' -o -name '*.pyc' \) -delete && \
+    conda clean -afy
+
+# =============================================================================
 # Environment Variables
 # =============================================================================
 ENV TZ=America/Chicago
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PIP_ROOT_USER_ACTION=ignore
 # Server defaults — all overridable at runtime via docker run -e or compose
 ENV HOST=0.0.0.0
 ENV PORT=3000
@@ -47,6 +61,7 @@ ENV WARMUP_ALWAYS_DAYS=90
 ENV CDP_SHARE_DEFAULT_CONTEXT=true
 # Empty = Chrome's real user-agent
 ENV USER_AGENT=""
+# Chrome window size; start.sh also sizes the Xvfb display (SCREEN_GEOMETRY) from these
 ENV WINDOW_WIDTH=1920
 ENV WINDOW_HEIGHT=1080
 ENV LOG_LEVEL=INFO
@@ -67,88 +82,30 @@ ENV EXTRA_CHROME_ARGS=""
 # Override DEBUG_SNAPSHOT_DIR to a volume-backed path to persist them.
 ENV DEBUG_SNAPSHOT=false
 ENV DEBUG_SNAPSHOT_DIR=/tmp/sbfetcher
+# VNC viewer (from the base image): ENABLE_VNC=true serves noVNC on port 6080; VNC_PASSWORD (empty = none).
+# Anyone who can reach that port can control Chrome.
 
 # =============================================================================
 # System Dependencies
 # =============================================================================
-# tzdata for timezone config; curl for HEALTHCHECK; gnupg/ca-certificates for
-# the Google Chrome apt repo; remaining libs are Chrome shared-library deps.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        tzdata \
-        ca-certificates \
-        curl \
-        gnupg \
-        wget \
-        unzip \
-        fonts-liberation \
-        libasound2t64 \
-        libatk-bridge2.0-0 \
-        libatk1.0-0 \
-        libcups2 \
-        libdbus-1-3 \
-        libdrm2 \
-        libgbm1 \
-        libgtk-3-0 \
-        libnspr4 \
-        libnss3 \
-        libx11-xcb1 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxfixes3 \
-        libxkbcommon0 \
-        libxrandr2 \
-        xdg-utils \
-        xvfb \
-    && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
-    && dpkg-reconfigure -f noninteractive tzdata \
-    && rm -rf /var/lib/apt/lists/*
+# tzdata for timezone config; curl for HEALTHCHECK. Chromium and its libraries come from the base image.
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    ln -fs /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo "$TZ" > /etc/timezone && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends tzdata curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# =============================================================================
-# Chrome Installation
-# =============================================================================
-# amd64 → Google Chrome stable (official .deb from Google)
-# arm64 → Playwright's pre-built Chromium binary.
-#          Ubuntu Noble arm64 ships only a snap-redirect stub for chromium
-#          (package 2:1snap1-*), which cannot run inside Docker.  We use pip
-#          to drive the Playwright browser download, then remove the Python
-#          package — only the binary is kept.
-# Pure CDP Mode drives the browser directly — no chromedriver required.
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-        amd64) \
-            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-                | gpg --dearmor -o /usr/share/keyrings/google-linux-keyring.gpg; \
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-keyring.gpg] \
-                  https://dl.google.com/linux/chrome/deb/ stable main" \
-                > /etc/apt/sources.list.d/google-chrome.list; \
-            apt-get update && \
-            apt-get install -y --no-install-recommends google-chrome-stable && \
-            rm -rf /var/lib/apt/lists/*; \
-            ln -sf /usr/bin/google-chrome-stable /usr/bin/chromium-browser; \
-            ;; \
-        arm64) \
-            pip install --quiet playwright; \
-            PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers playwright install chromium; \
-            CHROMIUM_BIN=$(find /opt/playwright-browsers -type f -name 'chrome' -perm /111 \
-                           2>/dev/null | head -1); \
-            [ -n "$CHROMIUM_BIN" ] || { echo "Playwright Chromium binary not found" >&2; exit 1; }; \
-            ln -sf "$CHROMIUM_BIN" /usr/bin/chromium-browser; \
-            pip uninstall -y playwright; \
-            ;; \
-        *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
-    esac
-
-# Verify the Chrome binary is on PATH
-RUN chromium-browser --version
+# Verify the Chromium binary (Debian's, from the base image) is on PATH; SeleniumBase finds it there
+RUN chromium --version
 
 # =============================================================================
 # Application Setup & Python Package Installation
 # =============================================================================
 WORKDIR /app
-
 COPY environment.yml .
-RUN mamba env create -f environment.yml && \
+
+RUN mamba env create -y -f environment.yml && \
     echo "source activate app" >> ~/.bashrc && \
     mamba clean -afy
 
@@ -163,15 +120,14 @@ COPY server.py start.sh ./
 # An empty folder results in Chrome creating a fresh profile on first launch.
 COPY chromiumprofile/ /app/chromiumprofile/
 
-# Ensure the entrypoint script is executable
-RUN chmod +x start.sh
-
 # =============================================================================
 # Container Configuration
 # =============================================================================
+# 3000: CDP relay + /health. The base image already exposes 6080 (noVNC, only with ENABLE_VNC=true).
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:${PORT}/health || exit 1
 
+ENTRYPOINT ["tini", "--"]
 CMD ["bash", "/app/start.sh"]

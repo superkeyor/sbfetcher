@@ -48,6 +48,7 @@ docker run -d \
   --shm-size=512m \
   --cap-add=SYS_ADMIN \
   -p 3000:3000 \
+  -p 3001:6080 \
   superkeyor/sbfetcher:latest
 ```
 
@@ -92,13 +93,15 @@ docker login
 | `CDP_SHARE_DEFAULT_CONTEXT` | `true` | Map Playwright's `new_context()` onto the persistent profile |
 | `USER_AGENT` | `` | Override Chrome's UA (empty = real UA; recommended) |
 | `PROFILE_MAX_MB` | unset (= off) | Optional size limit for the Chrome profile. If it is bigger when the container starts, the cache folders are deleted (cached pages, images); cookies, site storage, extensions and the warm-up memory are kept. Leave unset or `0` to never trim |
-| `WINDOW_WIDTH` | `1920` | Chrome window / Xvfb width |
+| `WINDOW_WIDTH` | `1920` | Chrome window / Xvfb width (`start.sh` sets the base image's `SCREEN_GEOMETRY` from these) |
 | `WINDOW_HEIGHT` | `1080` | Chrome window / Xvfb height |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 | `EXTRA_CHROME_ARGS` | `` | Space-separated extra Chrome flags, e.g. `--load-extension=/ext` (mount the unpacked extension folder at `/ext`) |
 | `HEADED` | `true` | Run Chrome in a virtual Xvfb display instead of `--headless` |
 | `CHROME_USER_DATA_DIR` | `/app/chromiumprofile` | Chrome profile dir; defaults to the folder baked into the image |
 | `DEBUG_SNAPSHOT` | `false` | Save HTML + PNG of every warm-up visit to `DEBUG_SNAPSHOT_DIR` |
+| `ENABLE_VNC` | `false` | Serve a live view of the headed Chrome on container port 6080 (see below). Needs `HEADED=true` |
+| `VNC_PASSWORD` | `` | Password for the VNC viewer (empty = none) |
 
 Playwright timeouts are controlled by changedetection.io (e.g. its `CONNECTION_TIMEOUT` env var), not by sbfetcher.
 
@@ -124,6 +127,22 @@ Also:
 
 ---
 
+## Watching Chrome (VNC)
+
+Set `ENABLE_VNC=true`, publish the viewer's container port 6080 as 3001 (`-p 3001:6080`; already in
+`docker-compose.yml`) and open `http://<host>:3001`. The viewer comes from the
+[chromiumkit](https://hub.docker.com/r/superkeyor/chromiumkit) base image (x11vnc + noVNC). The page (noVNC) shows the Xvfb display with all Chrome
+windows: warm-ups, CAPTCHA solving, changedetection's pages. You can also click and type in it, for example to
+solve a challenge or log in to a site once (the cookies land in the shared profile).
+
+- Port 6080 (3001 on the host) serves only the viewer; x11vnc itself listens only inside the container. With
+  `ENABLE_VNC=false` nothing listens there.
+- Anyone who can reach port 3001 can control Chrome (as with `/cdp` on 3000). Set `VNC_PASSWORD` if the port is not
+  private, and keep it off untrusted networks either way: the VNC password is not encryption.
+- Mouse and keyboard input during a warm-up can disturb it. Leave `ENABLE_VNC=false` when you do not need it.
+
+---
+
 ## Notes
 
 - **Pure CDP Mode**: Chrome is launched and driven over the Chrome DevTools Protocol — no WebDriver, no chromedriver, no `--enable-automation`.
@@ -132,5 +151,5 @@ Also:
 - **One window per page**: with the shared context, every page a client opens gets its own Chrome window. A tab hidden behind another tab renders no frames, which made `Page.screenshot` time out when the warm-up tab came to the front.
 - **One browser, many clients**: each `/cdp` client gets its own CDP connection to the same Chrome. With the shared context, concurrent clients see each other's pages (Playwright auto-attaches to every page in the context); use `FETCH_WORKERS=1` in changedetection.io if that causes trouble.
 - **Self-healing**: `/health` and new `/cdp` connections restart Chrome if it has died. Docker itself does not restart unhealthy containers.
-- **ARM64**: uses Playwright's Chromium build (Google does not ship ARM64 `.deb` packages). amd64 uses `google-chrome-stable` from Google's apt repo.
+- **Browser**: Debian's Chromium from the [chromiumkit](https://hub.docker.com/r/superkeyor/chromiumkit) base image, on both amd64 and arm64 (Google does not ship ARM64 `.deb` packages, so one browser for both). Google Chrome is no longer used.
 - `SYS_ADMIN` capability is required for Chrome's namespace sandbox inside Docker. If your host policy forbids it, add `--no-sandbox` via `EXTRA_CHROME_ARGS`.

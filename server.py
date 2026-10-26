@@ -106,7 +106,6 @@ log = logging.getLogger("sbfetcher")
 _cdp_driver: Any = None        # cdp_driver instance (the browser process)
 _tab: Any = None               # the server's own CDP tab
 _driver_lock = asyncio.Lock()
-_xvfb_proc: Any = None         # Xvfb subprocess (only when HEADED=True)
 _chrome_debug_port: int | None = None  # Chrome remote debugging port
 _restart_task: asyncio.Task | None = None
 # Smart warm-up memory, keyed by host (see _host_key):
@@ -186,11 +185,14 @@ async def _build_cdp_browser() -> tuple[Any, Any]:
     # no_sandbox=True is required inside Docker containers.
     driver = await cdp_driver.start_async(
         headless=not HEADED,
+        # headed=True: use the base image's Xvfb (DISPLAY=:99). Without it SeleniumBase starts a second,
+        # 1366x768 Xvfb of its own on Linux, which the VNC viewer does not show.
+        headed=HEADED,
         no_sandbox=True,
         agent=USER_AGENT,
         lang="en-US",
         # browser_executable_path can be set if Chrome is not on PATH;
-        # the Dockerfile symlinks chromium-browser onto PATH.
+        # SeleniumBase finds the base image's /usr/bin/chromium on PATH.
         user_data_dir=CHROME_USER_DATA_DIR,
         browser_args=extra,  # the launcher ignores unknown keyword arguments, so the name matters
     )
@@ -245,18 +247,9 @@ def _schedule_restart() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _xvfb_proc
-    # Startup: launch Xvfb virtual display when running headed
-    if HEADED:
-        import subprocess
-        _xvfb_proc = subprocess.Popen(
-            ["Xvfb", ":99", "-screen", "0", f"{WINDOW_W}x{WINDOW_H}x24", "-ac"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        os.environ["DISPLAY"] = ":99"
-        await asyncio.sleep(0.5)  # give Xvfb time to initialise
-        log.info("Xvfb started on :99 (%dx%d, headed mode)", WINDOW_W, WINDOW_H)
+    # The Xvfb display (and the optional VNC viewer) comes from the base image: start.sh runs vnc-start
+    if HEADED and not os.environ.get("DISPLAY"):
+        log.warning("HEADED=true but DISPLAY is unset: Chrome needs an X display (start.sh runs vnc-start)")
     # Startup: shrink the profile's caches if it grew past PROFILE_MAX_MB (Chrome must not be running yet)
     await asyncio.to_thread(_trim_profile)
     # Startup: warm up the CDP browser
@@ -280,11 +273,6 @@ async def lifespan(app: FastAPI):
             pass
         _cdp_driver = None
         _tab = None
-    # Shutdown: stop Xvfb if we started it
-    if _xvfb_proc is not None:
-        _xvfb_proc.terminate()
-        _xvfb_proc = None
-        log.info("Xvfb stopped")
 
 
 # ---------------------------------------------------------------------------
