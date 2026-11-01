@@ -1,25 +1,71 @@
-.env
-.git
-.gitignore
-.dockerignore
-.vscode/
-__pycache__/
-*.py[cod]
-*.so
-# *.db
-# *.sqlite3
-*.log
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-.DS_Store
-._*
-Thumbs.db
-README.md
-AGENTS.md
-LICENSE
-docker-compose*.y*ml
-upload
-run
+# .dockerignore decides what goes into the build
+# rsync decides what lands on the server.
+# 
+# Allowlist: send only what the Dockerfile COPYs, so secrets (.env), .git and
+# local files never reach the build context or the image (e.g. on Docker Hub).
+# 
+# If the Dockerfile COPYs something new, add it here with "!".
+# .dockerignore has the final veto on the Dockerfile:
+#     - COPY of an excluded file fails ("not found")
+#     - COPY of a folder silently skips excluded files
+#     - the Dockerfile itself is always read, even if excluded
+*
+!app
+!web
+!environment.yml
+!start.sh
+!crontab
+!server.py
+!chromiumprofile
+
+# ====================================
+# Prune inside allowed folders
+# ====================================
+# Later rules win. Use "**/" to match at any depth (plain patterns match only the root).
+# 
+# If the app needs an excluded secret file (e.g. app/pysecrets.py):
+#     1. Mount it at runtime in compose (volumes: ./app/pysecrets.py:/app/pysecrets.py:ro)
+#     2. Move the values into .env and read them with os.getenv, so the file isn't needed at all
+
+# Secrets
+**/.env
+**/.env.*
+**/archive/
+**/vault/
+**/secret/
+**/secrets/
+**/secret.py
+**/pysecrets.py
+**/local_settings.py
+
+# Local data
+**/upload
+**/instance
+**/*.db
+**/*.sqlite3
+**/*.log
+
+# Editors
+**/.vscode
+**/.idea
+
+# OS
+**/.DS_Store
+**/._*
+**/Thumbs.db
+
+# Python
+**/.venv
+**/venv
+**/env
+**/__pycache__
+**/*.py[cod]
+**/.ipynb_checkpoints
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+
+# Node
+**/node_modules
