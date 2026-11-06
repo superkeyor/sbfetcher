@@ -133,6 +133,8 @@ _PROFILE_CACHE_DIRS = (
     "Default/Cache", "Default/Code Cache", "Default/GPUCache", "Default/DawnWebGPUCache",
     "Default/DawnGraphiteCache", "Default/Media Cache", "Default/Service Worker/CacheStorage",
     "Default/Service Worker/ScriptCache", "GPUCache", "ShaderCache", "GrShaderCache", "component_crx_cache",
+    # Chrome's own usage statistics (.pma files, one per launch); a crash loop piles them up (54 GB seen)
+    "BrowserMetrics", "DeferredBrowserMetrics",
 )
 
 
